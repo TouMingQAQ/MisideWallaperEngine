@@ -3,7 +3,7 @@
 > 这份文件是**前后端与 Unity 端共同的唯一事实来源**。三边同时开发时，任何一边都不许私自改字段名；
 > 需要改先改这里。
 
-工程根：`D:\Project\MisideWallpaperEngine`（Tauri 2 + TypeScript + Rust）
+工程根：仓库根目录（Tauri 2 + TypeScript + Rust）
 
 ---
 

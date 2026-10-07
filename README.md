@@ -47,6 +47,30 @@ src-tauri/target/release/bundle/nsis/*.exe                   NSIS 安装包
 
 把 exe 与同目录的 `binaries\ProcessAudioCapture.dll` 一起拷走即可免安装运行。
 
+### 发版本（GitHub Actions）
+
+版本号有 5 处需要同步（`package.json`、`package-lock.json`、`tauri.conf.json`、`Cargo.toml`、
+`Cargo.lock`），不要手改，用脚本一次写完：
+
+```powershell
+node scripts/set-version.mjs 0.0.2   # 写入全部 5 处
+git commit -am "release: v0.0.2"
+git tag v0.0.2                        # 打 tag 即触发发布
+git push origin main --tags
+```
+
+[`.github/workflows/release.yml`](.github/workflows/release.yml) 会在 tag 推送后自动：
+
+1. 校验 tag、手动输入与 `package.json` 的版本完全一致（不一致直接失败，避免发出对不上号的包）；
+2. 构建前端并跑 Rust 单测（3 个直接调 `ProcessAudioCapture.dll` 采集 WASAPI 的用例需要音频设备，
+   CI 上跳过；其余全部作为发布门槛）；
+3. `npm run app:build` 打包 NSIS；
+4. 发布 Release，附 **NSIS 安装包**与 **免安装 zip**（`binaries/ProcessAudioCapture.dll` 放在子目录，
+   与 `pac.rs` 的查找顺序一致）。
+
+也可以在 Actions 页面手动 `Run workflow`，用 `version` 输入框指定版本（留空则取 `package.json`），
+并可勾选先建草稿 Release。
+
 ### 界面：一个仪表盘 + 一个设置弹窗
 
 主界面不做分页，打开就是三块东西：
@@ -237,7 +261,10 @@ miside-wallpaper-engine/
 │   ├── api-contract.md              # 前后端与 Unity 三方的接口契约（唯一事实来源）
 │   ├── protocol.md                  # UDP 协议逐字节表
 │   └── unity-integration.md         # Unity 接入与排查
-└── scripts/with-msvc.mjs            # 注入 MSVC 环境后执行命令
+├── .github/workflows/release.yml    # 打 tag 自动构建并发布 Release
+└── scripts/
+    ├── with-msvc.mjs                # 注入 MSVC 环境后执行命令
+    └── set-version.mjs              # 一次性写入全部 5 处版本号
 ```
 
 ## 测试

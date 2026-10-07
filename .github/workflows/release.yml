@@ -1,0 +1,230 @@
+name: Release
+
+# 触发方式
+#   * 打 tag：git tag v0.0.1 && git push origin v0.0.1
+#   * 或在 Actions 页面手动 Run workflow（version 留空 tag 用 v<package.json 版本>）
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "要发布的版本号（例如 0.0.1）。留空则用 package.json 里的版本。"
+        required: false
+        type: string
+      draft:
+        description: "先建草稿 Release（不公开）"
+        required: false
+        default: false
+        type: boolean
+
+# 发布 Release 需要写权限
+permissions:
+  contents: write
+
+# 同一个 tag 重复触发时，取消上一轮未完成的构建
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    name: 构建并发布 Windows 安装包
+    runs-on: windows-latest
+
+    steps:
+      - name: 检出源码
+        uses: actions/checkout@v4
+
+      - name: 安装 Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: 安装 Rust 工具链
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      # 缓存 ~/.cargo 与 src-tauri/target。
+      # 注意：本仓库的 Cargo.lock 在 src-tauri/ 下而不是仓库根，
+      # 所以 workspace 路径要显式指到 src-tauri，否则缓存永远 miss。
+      - name: 缓存 Rust 构建
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      # npm ci 需要 lockfile 与 package.json 完全同步
+      - name: 安装前端依赖
+        run: npm ci
+
+      # ---- 版本一致性：tag / 输入 / 各清单必须完全一致 --------------------
+      - name: 解析并校验版本号
+        id: version
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $tagVersion = ""
+          if ("${{ github.ref_type }}" -eq "tag") {
+            $tagVersion = "${{ github.ref_name }}".TrimStart("v")
+          }
+
+          $inputVersion = "${{ inputs.version }}".Trim()
+
+          $pkgVersion = (Get-Content package.json -Raw | ConvertFrom-Json).version
+
+          # 三者取其一：优先 tag，其次手动输入，最后 package.json
+          $version = @($tagVersion, $inputVersion, $pkgVersion) |
+            Where-Object { $_ -and $_.Trim() -ne "" } |
+            Select-Object -First 1
+
+          if ($version -notmatch '^\d+\.\d+\.\d+') {
+            throw "版本号不合法：'$version'（应为 x.y.z）"
+          }
+
+          # tag 与清单不一致时必须失败，否则会发出一个版本号对不上的包
+          if ($tagVersion -and $tagVersion -ne $pkgVersion) {
+            throw "tag 是 v$tagVersion，但 package.json 是 $pkgVersion。请先运行：node scripts/set-version.mjs $tagVersion"
+          }
+
+          Write-Host "发布版本：$version"
+          # 显式用 Out-File：Windows PowerShell 的 `>>` 默认写 UTF-16，会毁掉 GITHUB_OUTPUT
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "tag=v$version"    | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      # 把版本写进全部 5 处清单（tag 推送时值已经一致，这里只是兜底）
+      - name: 同步版本号到各清单
+        shell: pwsh
+        run: node scripts/set-version.mjs "${{ steps.version.outputs.version }}"
+
+      # tauri.conf.json 声明的 resources 里必须有 ProcessAudioCapture.dll，
+      # 缺了的话 tauri build 会以 "resource not found" 直接失败。
+      - name: 校验随包分发的采集内核
+        shell: pwsh
+        run: |
+          $dll = "src-tauri/binaries/ProcessAudioCapture.dll"
+          if (-not (Test-Path $dll)) { throw "缺少 $dll，无法打包" }
+          Write-Host "$dll -> $([math]::Round((Get-Item $dll).Length/1KB)) KB"
+
+      # 前端类型检查 + 构建
+      - name: 构建前端
+        run: npm run build
+
+      # 这 3 个测试直接调用 ProcessAudioCapture.dll 的 WASAPI 采集，
+      # GitHub 的 windows runner 没有音频设备，必然是死路 —— 连同依赖它们的用例一起跳过。
+      # 其余测试（包布局、zip 导入、prefs 归一化、显示器枚举……）照常跑，作为发布门槛。
+      - name: 运行 Rust 单元测试
+        run: >
+          cargo test --manifest-path src-tauri/Cargo.toml --lib --
+          --skip captures_audio_through_the_dll
+          --skip enumerates_targets_with_media
+          --skip finds_and_loads_bundled_dll
+
+      # 用项目自己的脚本构建：它会先定位并导入 vcvars64 的环境（本机 VS 不在默认目录），
+      # 找不到时会打印提示并继续，因此在 runner 上同样安全。
+      - name: 打包 Tauri 应用
+        run: npm run app:build
+
+      # ---- 产物汇总 -------------------------------------------------------
+      - name: 收集产物
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          # 1. NSIS 安装包
+          $setup = Get-ChildItem "src-tauri/target/release/bundle/nsis" -Filter "*.exe" -ErrorAction SilentlyContinue
+          if (-not $setup) { throw "没找到 NSIS 安装包，打包可能失败了" }
+
+          # 2. 免安装版：主程序放根、采集内核放 binaries/ 子目录。
+          #    这个布局不能改：pac.rs 的 candidate_paths() 会依次找 <exe目录>、
+          #    <exe目录>/binaries、<exe目录>/resources...，DLL 必须在其中之一。
+          $exe = "src-tauri/target/release/miside-wallpaper-engine.exe"
+          $dll = "src-tauri/target/release/binaries/ProcessAudioCapture.dll"
+          if (-not (Test-Path $exe)) { throw "没找到主程序 $exe" }
+          if (-not (Test-Path $dll)) { throw "没找到采集内核 $dll" }
+
+          $stage = "src-tauri/target/release/portable"
+          if (Test-Path $stage) { Remove-Item $stage -Recurse -Force }
+          New-Item -ItemType Directory -Force -Path "$stage/binaries" | Out-Null
+          Copy-Item $exe "$stage/"
+          Copy-Item $dll "$stage/binaries/"
+
+          $portable = "src-tauri/target/release/miside-wallpaper-engine-portable.zip"
+          if (Test-Path $portable) { Remove-Item $portable -Force }
+          Compress-Archive -Path "$stage/*" -DestinationPath $portable
+
+          Write-Host "将上传："
+          foreach ($f in @($setup) + @(Get-Item $portable)) {
+            Write-Host ("  {0}  ({1} MB)" -f $f.Name, [math]::Round($f.Length/1MB, 2))
+          }
+
+          # 校验免安装包内容：必须同时含 exe 与 binaries/ProcessAudioCapture.dll
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $zip = [System.IO.Compression.ZipFile]::OpenRead((Resolve-Path $portable))
+          try {
+            $entries = $zip.Entries | ForEach-Object { $_.FullName }
+            Write-Host "免安装包内容：$($entries -join ', ')"
+            if (-not ($entries -match '^miside-wallpaper-engine\.exe$')) { throw "免安装包缺少主程序" }
+            if (-not ($entries -match '^binaries/ProcessAudioCapture\.dll$')) { throw "免安装包缺少 binaries/ProcessAudioCapture.dll" }
+          } finally { $zip.Dispose() }
+
+      # ---- 打 tag（手动触发时需要） ---------------------------------------
+      - name: 创建并推送 tag
+        if: github.ref_type != 'tag'
+        shell: pwsh
+        run: |
+          $tag = "${{ steps.version.outputs.tag }}"
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if (git tag --list $tag) {
+            Write-Host "tag $tag 已存在，跳过创建"
+          } else {
+            git tag -a $tag -m "release $tag"
+            git push origin $tag
+          }
+
+      - name: 发布 Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: miside-wallpaper-engine ${{ steps.version.outputs.version }}
+          draft: ${{ inputs.draft || false }}
+          generate_release_notes: true
+          # 直接给出路径，不经 job 输出传递（避免多行值的转义问题）
+          files: |
+            src-tauri/target/release/bundle/nsis/*.exe
+            src-tauri/target/release/miside-wallpaper-engine-portable.zip
+          body: |
+            ## miside-wallpaper-engine ${{ steps.version.outputs.version }}
+
+            把一个 Unity 打包出来的 exe，变成会跟着音乐律动的桌面壁纸。
+            Windows 桌面工具（Tauri 2 + Rust + TypeScript）。
+
+            ### 下载
+
+            | 文件 | 说明 |
+            | --- | --- |
+            | `*_x64-setup.exe` | NSIS 安装包，推荐 |
+            | `*-portable.zip` | 免安装版：解压后主程序与 `ProcessAudioCapture.dll` 需放在同一目录 |
+
+            ### 运行要求
+
+            * Windows 10 1809 (17763) 及以上，x64
+            * WebView2 运行时——安装包会在缺失时自动下载引导程序
+            * 免安装版不含 WebView2 引导，系统没装过 WebView2 时建议用安装包
+
+            ### 提示
+
+            * 音频数据只经**本地 UDP（默认 `127.0.0.1:47810`）**推送给 Unity 壁纸端；
+              Unity 侧接入见 [docs/unity-integration.md](https://github.com/${{ github.repository }}/blob/${{ steps.version.outputs.tag }}/docs/unity-integration.md)。
+            * 本版本起配置目录为 `%APPDATA%\com.toumingqaq.miside-wallpaper-engine`，
+              旧版（`com.toumingqaq.miside-wallpaper`）的设置不会被读取。
+
+            > 音频采集内核 `ProcessAudioCapture.dll` 来自
+            > [TouMingQAQ/ProcessAudioCaptureUI](https://github.com/TouMingQAQ/ProcessAudioCaptureUI)。

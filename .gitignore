@@ -1,0 +1,30 @@
+# ---------------------------------------------------------------- Node / 前端
+node_modules/
+dist/
+*.tsbuildinfo
+
+# ------------------------------------------------------------------ Rust / Tauri
+# cargo 的构建目录（含 target-verify 这种单独指定的验证目录）
+target/
+target-verify/
+src-tauri/target/
+src-tauri/target-verify/
+# tauri-build 生成的 schema / 能力清单，构建时自动重建
+src-tauri/gen/
+
+# --------------------------------------------------------------- 编辑器 / 系统
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# -------------------------------------------------------------------- 日志 / 环境
+*.log
+npm-debug.log*
+.env
+.env.local
+.env.*.local

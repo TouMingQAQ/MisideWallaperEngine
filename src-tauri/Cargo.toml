@@ -1,0 +1,66 @@
+[package]
+name = "miside-wallpaper-engine"
+version = "0.0.1"
+description = "miside-wallpaper-engine：Unity exe 桌面壁纸宿主（压缩包导入、WorkerW 挂载、音频节奏推流）"
+authors = ["TouMingQAQ"]
+edition = "2021"
+rust-version = "1.82"
+
+[lib]
+name = "miside_wallpaper_engine_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+# 让产物就叫 miside-wallpaper-engine.exe（cargo 默认会用 crate 名，那个是全小写的）
+[[bin]]
+name = "miside-wallpaper-engine"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# 界面与 IPC
+tauri = { version = "2", features = ["tray-icon"] }
+# 选 zip / 选目录的原生对话框
+tauri-plugin-dialog = "2"
+# 第二个实例直接唤起第一个实例的主窗口
+tauri-plugin-single-instance = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# 采集内核（ProcessAudioCapture.dll）的动态绑定
+libloading = "0.8"
+# 壁纸包解压。只开 deflate：绝大部分 zip 都是 store/deflate，
+# 少装 bzip2/zstd 能显著缩短编译时间（遇到不支持的压缩法会明确报错）
+zip = { version = "8", default-features = false, features = ["deflate"] }
+# 中文 zip 常见的 GBK 文件名回退解码
+encoding_rs = "0.8"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+  "Win32_Foundation",
+  "Win32_Graphics_Dwm",
+  "Win32_Graphics_Gdi",
+  "Win32_Media_Audio",
+  "Win32_Security",
+  "Win32_System_Com",
+  "Win32_System_Com_StructuredStorage",
+  "Win32_System_Diagnostics_ToolHelp",
+  "Win32_System_JobObjects",
+  "Win32_System_LibraryLoader",
+  "Win32_System_Power",
+  "Win32_System_ProcessStatus",
+  "Win32_System_Registry",
+  "Win32_System_SystemInformation",
+  "Win32_System_Threading",
+  "Win32_UI_HiDpi",
+  "Win32_UI_Input",
+  "Win32_UI_Input_KeyboardAndMouse",
+  "Win32_UI_Shell",
+  "Win32_UI_WindowsAndMessaging",
+] }
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true

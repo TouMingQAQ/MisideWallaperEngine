@@ -1,0 +1,27 @@
+{
+  "name": "miside-wallpaper-engine",
+  "private": true,
+  "version": "0.0.1",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "tauri": "tauri",
+    "app:dev": "node scripts/with-msvc.mjs tauri dev",
+    "app:build": "node scripts/with-msvc.mjs tauri build",
+    "check": "tsc --noEmit && cargo check --manifest-path src-tauri/Cargo.toml",
+    "test:rust": "node scripts/with-msvc.mjs cargo test --manifest-path src-tauri/Cargo.toml --lib -- --nocapture"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.9.0"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.9.0",
+    "typescript": "^5.9.2",
+    "vite": "^6.3.6"
+  },
+  "allowScripts": {
+    "esbuild@0.25.12": true
+  }
+}

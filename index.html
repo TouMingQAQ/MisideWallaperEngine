@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="dark light" />
+    <title>miside-wallpaper-engine</title>
+    <link rel="stylesheet" href="/src/styles.css" />
+  </head>
+  <body>
+    <!-- 单页仪表盘：顶栏 + 主区域（左：音频节奏 / 右：当前壁纸），设置全部在弹窗里 -->
+    <div id="app" class="app">
+      <header id="topbar" class="topbar"></header>
+      <main id="view" class="view"></main>
+      <div id="tray-hint" class="tray-hint"></div>
+      <div id="toasts" class="toasts" aria-live="polite"></div>
+      <div id="drop-overlay" class="drop-overlay" hidden>
+        <div class="drop-overlay__inner">
+          <div class="drop-overlay__icon">⬇</div>
+          <div class="drop-overlay__title" id="drop-overlay-text">松开鼠标导入壁纸压缩包</div>
+        </div>
+      </div>
+    </div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

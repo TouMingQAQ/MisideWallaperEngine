@@ -7,11 +7,9 @@
 //! * **绝不抢前台焦点**：以前为了键盘用 `SetForegroundWindow` 把前台抢给壁纸窗口，那会把桌面
 //!   图标层（`SHELLDLL_DefView`）顶成非激活状态 —— 图标点不中、拖不动、右键不出菜单；
 //!   关掉转发后前台还赖在壁纸窗口上，就成了「壁纸还能点、桌面全死」。现在前台永远留给桌面。
-//! * **被偷走的鼠标捕获一定要还**：合成 `WM_LBUTTONDOWN` 会让目标窗口的 `DefWindowProc`
-//!   调 `SetCapture`，而桌面图标拖动正是靠桌面图标层自己拿着捕获 —— 捕获被壁纸抢走，
-//!   图标拖到一半就断；要是抬起消息因为闸门关闭而没补上，捕获就**永久**留在壁纸窗口上，
-//!   于是「关掉转发后壁纸还能点、桌面图标点不动」。所以合成按下前先记住捕获在谁手里，
-//!   合成之后立刻还回去；停止转发时补发抬起消息并再还一次。
+//! * **鼠标按键走输入包**：不向壁纸投递合成按下/抬起消息。壁纸可能在处理按下时调用
+//!   `SetCapture`，使桌面收到 `WM_CAPTURECHANGED` 并取消框选；事后归还捕获无法恢复拖动。
+//!   按键状态仍由 `pointer_state()` 传给 Unity，移动与滚轮继续走窗口消息。
 //! * **钩子回调必须极快**：低层钩子超过系统的 `LowLevelHooksTimeout`（默认几百毫秒）会被
 //!   悄悄摘掉，全系统鼠标都会跟着变卡。所以回调里只做「拷贝字段 + 入队」，
 //!   `PostMessage`、`GetGUIThreadInfo` 这些可能阻塞的调用全放到转发线程里做。
@@ -118,6 +116,9 @@ static POINTER: Mutex<PointerState> = Mutex::new(PointerState {
     middle: false,
     wheel: 0,
 });
+
+#[derive(Clone, Copy)] struct PendingClick { message: u32, x: i32, y: i32, mouse_data: u32 }
+static PENDING_CLICK: Mutex<Option<PendingClick>> = Mutex::new(None);
 
 /// 队列上限：鼠标移动在高速拖动时能到每秒上千条，堆太多只会让壁纸看到过期的坐标。
 /// 满了就丢掉最老的**移动**事件（按键事件一条都不能丢）。
@@ -480,32 +481,15 @@ fn handle_event(event: Event) {
                 return;
             };
             update_pointer(target, message, x, y, mouse_data);
-            // 抬起消息**必须**转发，不能受闸门影响。
-            //
-            // 按下时闸门是开的，壁纸窗口因此拿到了捕获；如果用户在拖动过程中焦点跑掉
-            // （点了别的窗口、闸门关上），抬起就会被闸门挡下 —— 壁纸永远等不到抬起，
-            // 捕获就永久留在它手里，桌面图标整片点不动。这正是要修的故障。
-            let owed_release = is_button_up(message) && OWED_RELEASE.load(Ordering::SeqCst);
-            if !owed_release && (!MOUSE.load(Ordering::SeqCst) || !gate_open(target)) {
-                return;
-            }
-            // 合成按下之前先记下「鼠标该归谁」：桌面图标拖动就靠它
-            let previous = if is_button_down(message) {
-                desktop::capture_of_desktop()
-            } else {
-                HWND::default()
-            };
-            forward_mouse(target, message, x, y, mouse_data);
-            if is_button_down(message) {
-                // 欠壁纸一次抬起；合成按下也会让它把捕获抢走，稍后复查并还给桌面
-                OWED_RELEASE.store(true, Ordering::SeqCst);
-                schedule_repair(previous, target);
-            } else if is_button_up(message) {
-                OWED_RELEASE.store(false, Ordering::SeqCst);
-                // 抬起之后壁纸窗口自己也会松手，但别留个过期的待办去干扰后续操作
-                clear_pending();
-                // 顺手把可能残留的捕获还给桌面
-                hand_capture_back(HWND::default(), target);
+            if MOUSE.load(Ordering::SeqCst) && gate_open(target) {
+                if is_button_down(message) {
+                    *PENDING_CLICK.lock().unwrap_or_else(|e| e.into_inner()) = Some(PendingClick { message, x, y, mouse_data });
+                } else if is_button_up(message) {
+                    let pending = PENDING_CLICK.lock().unwrap_or_else(|e| e.into_inner()).take();
+                    if let Some(pending) = pending { if x.abs_diff(pending.x) <= 4 && y.abs_diff(pending.y) <= 4 { forward_click(target, pending, message, x, y, mouse_data); } }
+                } else {
+                    forward_mouse(target, message, x, y, mouse_data);
+                }
             }
         }
         Event::Key {
@@ -636,15 +620,15 @@ fn is_button_down(message: u32) -> bool {
     )
 }
 
-/// 这条消息是不是「抬起」。
-fn is_button_up(message: u32) -> bool {
-    matches!(
-        message,
-        WM_LBUTTONUP | WM_RBUTTONUP | WM_MBUTTONUP | WM_XBUTTONUP
-    )
+fn is_button_up(message: u32) -> bool { matches!(message, WM_LBUTTONUP | WM_RBUTTONUP | WM_MBUTTONUP | WM_XBUTTONUP) }
+
+fn forward_click(target: HWND, pending: PendingClick, up: u32, x: i32, y: i32, mouse_data: u32) {
+    let (cx, cy) = desktop::screen_to_client(target, x, y); let p = make_lparam(cx, cy);
+    let (dw, uw) = match pending.message { WM_LBUTTONDOWN=>(WPARAM(1),WPARAM(0)), WM_RBUTTONDOWN=>(WPARAM(2),WPARAM(0)), WM_MBUTTONDOWN=>(WPARAM(0x10),WPARAM(0)), WM_XBUTTONDOWN=>{let b=WPARAM(((mouse_data>>16)&0xffff) as usize);(b,b)}, _=>return };
+    unsafe { let _=PostMessageW(Some(target), pending.message, dw, p); let _=PostMessageW(Some(target), up, uw, p); }
 }
 
-/// 把钩子事件翻译成消息 post 给壁纸窗口。
+/// 只转发移动和滚轮；按键通过输入包传递，避免壁纸抢捕获并取消桌面框选。
 ///
 /// 坐标是**客户区**坐标；滚轮消息按 Windows 约定把增量放在 `wParam` 高位、屏幕坐标放在 `lParam`，
 /// 所以滚轮与其它消息分开处理。
@@ -654,20 +638,9 @@ fn forward_mouse(target: HWND, message: u32, x: i32, y: i32, mouse_data: u32) {
 
     let (post_message, wparam, lparam) = match message {
         WM_MOUSEMOVE => (WM_MOUSEMOVE, WPARAM(0), client_param),
-        WM_LBUTTONDOWN => (WM_LBUTTONDOWN, WPARAM(0x0001), client_param),
-        WM_LBUTTONUP => (WM_LBUTTONUP, WPARAM(0), client_param),
-        WM_RBUTTONDOWN => (WM_RBUTTONDOWN, WPARAM(0x0002), client_param),
-        WM_RBUTTONUP => (WM_RBUTTONUP, WPARAM(0), client_param),
-        WM_MBUTTONDOWN => (WM_MBUTTONDOWN, WPARAM(0x0010), client_param),
-        WM_MBUTTONUP => (WM_MBUTTONUP, WPARAM(0), client_param),
-        WM_XBUTTONDOWN | WM_XBUTTONUP => (
-            message,
-            WPARAM(((mouse_data >> 16) & 0xffff) as usize),
-            client_param,
-        ),
         WM_MOUSEWHEEL | WM_MOUSEHWHEEL => (
             message,
-            WPARAM(((mouse_data & 0xffff) << 16) as usize),
+            WPARAM((mouse_data & 0xffff0000) as usize),
             make_lparam(x, y),
         ),
         _ => return,

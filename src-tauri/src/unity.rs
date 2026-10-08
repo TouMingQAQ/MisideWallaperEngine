@@ -288,8 +288,12 @@ impl UnityHost {
                 desktop::find_main_window(pid)
             }
         });
+
+        // 先停输入转发：它要把被壁纸窗口抢走的鼠标捕获还给桌面，而这件事必须在
+        // 窗口被摘下来 / 进程被杀掉**之前**做（窗口没了就无从判断捕获在谁手里）。
+        crate::win::input::clear_target();
+
         if let Some(hwnd) = hwnd {
-            // 先把焦点还回去、再摘下来，免得杀掉一个前台窗口让系统愣一下
             let _ = desktop::detach(hwnd);
         }
 
@@ -305,7 +309,6 @@ impl UnityHost {
             let _ = control::terminate_process(pid);
         }
 
-        crate::win::input::clear_target();
         self.mode = Mode::Stopped;
         self.state = RuntimeState::default();
         self.applied_volume = None;
@@ -400,6 +403,9 @@ impl UnityHost {
                     }
                 } else {
                     self.state.attached = true;
+                    // 旧版本挂上去的窗口可能没有「不可激活」标记（那时候还没有这个设计），
+                    // 补一次，否则它仍能当前台窗口、把桌面图标顶成非激活状态
+                    desktop::enforce_no_activate(hwnd);
                     // 显示器设置变了就按新几何摆一次（尺寸永远是整块屏，渲染倍率不在这里）
                     let rect = desktop::target_rect(settings.monitor_index);
                     let wanted = (rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top);

@@ -28,13 +28,13 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, FindWindowExW, FindWindowW, GetAncestor, GetClassNameW, GetClientRect,
-    GetForegroundWindow, GetParent, GetSystemMetrics, GetWindowLongPtrW, GetWindowRect,
-    GetWindowThreadProcessId, IsChild, IsIconic, IsWindow, IsWindowVisible, SendMessageTimeoutW,
-    SetForegroundWindow, SetParent, SetWindowLongPtrW, SetWindowPos, ShowWindow, GA_ROOT,
-    GWL_EXSTYLE, GWL_STYLE, HWND_TOP, SMTO_NORMAL, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
-    SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_SHOWWINDOW,
-    SW_SHOW, WS_CAPTION, WS_CHILD, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW, WS_MAXIMIZEBOX,
-    WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU, WS_THICKFRAME,
+    GetForegroundWindow, GetGUIThreadInfo, GetParent, GetShellWindow, GetSystemMetrics,
+    GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId, IsChild, IsIconic, IsWindow,
+    IsWindowVisible, SendMessageTimeoutW, SetParent, SetWindowLongPtrW, SetWindowPos, ShowWindow,
+    GA_ROOT, GUITHREADINFO, GWL_EXSTYLE, GWL_STYLE, HWND_TOP, SMTO_NORMAL, SM_CXVIRTUALSCREEN,
+    SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SWP_FRAMECHANGED, SWP_NOACTIVATE,
+    SWP_SHOWWINDOW, SW_SHOW, WS_CAPTION, WS_CHILD, WS_EX_APPWINDOW, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU, WS_THICKFRAME,
 };
 
 // `windows` crate 把 `PrintWindow` 的元数据归到了 `Win32::Storage::Xps` 下（元数据归类如此），
@@ -154,7 +154,15 @@ pub fn attach(hwnd: HWND, monitor_index: i32) -> Result<(), String> {
         SetWindowLongPtrW(hwnd, GWL_STYLE, stripped);
 
         let ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-        let ex_new = (ex_style & !(WS_EX_APPWINDOW.0 as isize)) | WS_EX_TOOLWINDOW.0 as isize;
+        // `WS_EX_NOACTIVATE`：壁纸窗口永远不许被激活。
+        //
+        // 这是「桌面图标点不动」这类问题的根：壁纸窗口一旦成了前台窗口，桌面图标层
+        // （`SHELLDLL_DefView`）就不是激活窗口了 —— 单击选不中、拖不动、右键不出菜单，
+        // 而且焦点会一直赖在壁纸窗口上。挂载时就把它标成不可激活，
+        // 就算壁纸进程自己（或别的什么）想抢前台也抢不走。
+        let ex_new = (ex_style & !(WS_EX_APPWINDOW.0 as isize))
+            | WS_EX_TOOLWINDOW.0 as isize
+            | WS_EX_NOACTIVATE.0 as isize;
         SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex_new);
 
         // 2. 挂到壁纸层
@@ -208,7 +216,9 @@ pub fn detach(hwnd: HWND) -> Result<(), String> {
         SetWindowLongPtrW(hwnd, GWL_STYLE, restored);
 
         let ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-        let ex_new = (ex_style & !(WS_EX_TOOLWINDOW.0 as isize)) | WS_EX_APPWINDOW.0 as isize;
+        // 摘下来就恢复成普通窗口：`WS_EX_NOACTIVATE` 一起清掉，否则点它不进前台
+        let ex_new = (ex_style & !(WS_EX_TOOLWINDOW.0 as isize | WS_EX_NOACTIVATE.0 as isize))
+            | WS_EX_APPWINDOW.0 as isize;
         SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex_new);
 
         // 从 WorkerW 的子窗口变回顶层窗口后，位置要重新放回可见区域
@@ -226,6 +236,32 @@ pub fn detach(hwnd: HWND) -> Result<(), String> {
     }
     *ATTACHED.lock().unwrap_or_else(|e| e.into_inner()) = None;
     Ok(())
+}
+
+/// 确保壁纸窗口带着「不可激活」标记。
+///
+/// 为什么要单独有个补救函数：`attach()` 只在**挂载那一刻**设过一次扩展样式。
+/// 用户从旧版本升上来、或窗口是别的路径挂上去的，可能已经挂在 WorkerW 上了却没有这个标记，
+/// 于是它照样能当前台窗口，桌面图标还是会被顶成非激活。每轮扫描补一次，成本是一次
+/// `GetWindowLongPtr` / `SetWindowLongPtr`，可以忽略。
+///
+/// 返回是否**改动**了样式。
+pub fn enforce_no_activate(hwnd: HWND) -> bool {
+    if hwnd.is_invalid() {
+        return false;
+    }
+    unsafe {
+        let ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+        if ex_style & WS_EX_NOACTIVATE.0 as isize != 0 {
+            return false;
+        }
+        SetWindowLongPtrW(
+            hwnd,
+            GWL_EXSTYLE,
+            ex_style | WS_EX_NOACTIVATE.0 as isize,
+        );
+    }
+    true
 }
 
 /// 记在案的目标窗口是否还挂在壁纸层上。
@@ -548,13 +584,98 @@ pub fn is_desktop_foreground() -> bool {
     }
 }
 
-/// 把真实焦点交给壁纸窗口（键盘转发要靠它：合成按键 Chromium / Unity 都可能丢）。
-pub fn focus_window(hwnd: HWND) {
+/* ------------------------------------------------- 输入队列 / 鼠标捕获 */
+
+/// 桌面图标列表（`SHELLDLL_DefView` 下的 `SysListView32`）。
+///
+/// 它是桌面鼠标输入的合法持有者：被壁纸窗口抢走的捕获要还，就该还给它 ——
+/// 还给它等于「拖到一半的图标接着拖」，而单纯 `ReleaseCapture` 会把拖动打断。
+pub fn icon_listview() -> Option<HWND> {
+    unsafe {
+        let mut defview: HWND = HWND::default();
+        let _ = EnumWindows(
+            Some(enum_for_defview),
+            LPARAM(&mut defview as *mut HWND as isize),
+        );
+        if defview.is_invalid() {
+            return None;
+        }
+        let list = find_ex(Some(defview), Some(HWND::default()), w!("SysListView32"));
+        (!list.is_invalid()).then_some(list)
+    }
+}
+
+/// 找「有 `SHELLDLL_DefView` 子窗口」的那个顶层窗口，记下那个子窗口。
+unsafe extern "system" fn enum_for_defview(window: HWND, reference: LPARAM) -> BOOL {
+    let view = find_ex(Some(window), Some(HWND::default()), w!("SHELLDLL_DefView"));
+    if !view.is_invalid() {
+        *(reference.0 as *mut HWND) = view;
+        return BOOL(0);
+    }
+    TRUE
+}
+
+/// 桌面外壳窗口（Progman 或挂图标层的 WorkerW）。
+///
+/// 它的线程就是 explorer 的桌面线程 —— 桌面图标列表、`SetCapture` 都归这条输入队列管。
+/// 拿不到 `Progman` 时依次退回图标层 WorkerW 与 `GetShellWindow()`。
+pub fn desktop_window() -> Option<HWND> {
+    unsafe {
+        if let Ok(progman) = FindWindowW(w!("Progman"), PCWSTR::null()) {
+            if !progman.is_invalid() {
+                return Some(progman);
+            }
+        }
+        // Progman 找不到就退到「挂着 SHELLDLL_DefView 的那个窗口」——
+        // Win11 24H2 起桌面图标层在 WorkerW 上，它和 Progman 同属一条桌面线程。
+        let mut defview: HWND = HWND::default();
+        let _ = EnumWindows(
+            Some(enum_for_defview),
+            LPARAM(&mut defview as *mut HWND as isize),
+        );
+        if !defview.is_invalid() {
+            if let Ok(parent) = GetParent(defview) {
+                if !parent.is_invalid() {
+                    return Some(parent);
+                }
+            }
+        }
+        let shell = GetShellWindow();
+        (!shell.is_invalid()).then_some(shell)
+    }
+}
+
+/// 窗口所在线程 id（0 = 无效窗口）。
+pub fn window_thread(hwnd: HWND) -> u32 {
     if hwnd.is_invalid() {
-        return;
+        return 0;
+    }
+    unsafe { GetWindowThreadProcessId(hwnd, None) }
+}
+
+/// 某条输入队列当前拿着的鼠标捕获窗口。
+pub fn capture_of_thread(thread: u32) -> HWND {
+    if thread == 0 {
+        return HWND::default();
     }
     unsafe {
-        let _ = SetForegroundWindow(hwnd);
+        let mut info = GUITHREADINFO {
+            cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
+            ..Default::default()
+        };
+        if GetGUIThreadInfo(thread, &mut info).is_ok() {
+            info.hwndCapture
+        } else {
+            HWND::default()
+        }
+    }
+}
+
+/// 桌面线程当前拿着的鼠标捕获窗口。
+pub fn capture_of_desktop() -> HWND {
+    match desktop_window() {
+        Some(window) => capture_of_thread(window_thread(window)),
+        None => HWND::default(),
     }
 }
 

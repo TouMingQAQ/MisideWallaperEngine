@@ -217,8 +217,11 @@ public class CommandLineConfig : MonoBehaviour
 | 输入类型 | 宿主怎么转发 | 旧版 Input Manager | 新版 Input System |
 | --- | --- | --- | --- |
 | **鼠标**（移动/按键/滚轮） | 向壁纸窗口**合成窗口消息**（`WM_MOUSEMOVE` / `WM_LBUTTONDOWN` / `WM_LBUTTONUP` / `WM_MOUSEWHEEL` …） | ✅ 能收到 | ❌ **收不到**（新版走 Raw Input / `WM_INPUT`，必须有真实硬件事件） |
-| **键盘** | 把真实交点交给壁纸窗口，按键是真实输入 | ✅ | ✅ |
+| **键盘**（按下/抬起） | 同样**合成窗口消息**（`WM_KEYDOWN` / `WM_KEYUP` / `WM_SYS*`） | ✅ 能收到 | ❌ **收不到**（同上，走 Raw Input） |
 | **指针状态** | 宿主在**输入包**里一并推给你 | ✅ | ✅（和输入系统完全无关） |
+
+> **宿主不抢前台焦点**：合成消息不依赖焦点，桌面始终是前台窗口，
+> 所以桌面图标的点击 / 拖动 / 右键菜单都不会被输入转发影响。
 
 结论与建议：
 
@@ -226,7 +229,8 @@ public class CommandLineConfig : MonoBehaviour
 * 或者**完全不用 Unity 的鼠标输入**，改用本脚本提供的：
   `PointerPosition` / `PointerNormalized` / `PointerViewport` / `PointerInside` /
   `PointerLeft` / `PointerRight` / `PointerMiddle` / `PointerWheelDelta` / `PointerLocked`；
-* 键鼠同时要时也可以混用：键盘用 `Input.GetKey`，鼠标用 `MisideAudioLink` 的属性。
+* 键盘同理：旧版 Input Manager 用 `Input.GetKey` 直接收合成消息；
+  新版 Input System 收不到合成按键，要么切回旧版输入系统，要么自己从输入包里读指针状态做交互。
 
 ```csharp
 void Update()

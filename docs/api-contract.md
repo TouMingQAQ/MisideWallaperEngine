@@ -36,7 +36,7 @@ JSON 一律 **camelCase**。字段全部有默认值：文件缺失 / 坏掉 / �
 | `pauseOnFullscreen` | bool | `true` | 全屏应用 / 演示模式时暂停壁纸 |
 | `pauseOnBattery` | bool | `false` | 使用电池时暂停壁纸 |
 | `pauseWhenForeground` | bool | `false` | 前台窗口最大化（非桌面）时暂停壁纸 |
-| `inputForward` | bool | `false` | 是否把鼠标/键盘转发给壁纸窗口 |
+| `inputForward` | bool | `false` | 是否把鼠标/键盘转发给壁纸窗口（合成窗口消息，**不抢前台焦点**） |
 | `inputLocked` | bool | `false` | 锁定：完全不转发（防误触） |
 | `customParams` | array | 见下 | 透传给壁纸端的业务参数（宿主不解释语义） |
 | `reportPort` | number | `47811` | 接收壁纸端「参数能力上报」的 UDP 端口，`0` = 关闭 |

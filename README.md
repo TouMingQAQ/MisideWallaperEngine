@@ -121,7 +121,7 @@ git push origin main --tags
 | | 额外启动参数 | 原样拼在 Unity 启动命令行后面 |
 | | 暂停 / 重载 | 暂停 = 挂起进程（`NtSuspendProcess`），恢复即继续；重载 = 重启进程 |
 | 暂停条件 | 全屏应用时 / 电池供电时 / 前台窗口最大化时 | 命中条件自动挂起壁纸，条件消失自动恢复。全屏判定用 `SHQueryUserNotificationState`，但**不把 `QUNS_BUSY` 单独当全屏**（切换窗口、Alt+Tab、开开始菜单时外壳会短暂报忙），还要求前台真有一个盖满显示器的窗口；另外条件必须**连续满足 3 秒**才生效 —— 否则会出现"切个窗口壁纸就停一下"。每次自动暂停/恢复都会写日志并带上原因 |
-| 输入 | 转发鼠标键盘 | 桌面在前台时，鼠标事件转给壁纸窗口；键盘靠把真实焦点交给它 |
+| 输入 | 转发鼠标键盘 | 桌面在前台时，把鼠标与键盘事件**合成窗口消息**发给壁纸窗口；**不抢前台焦点**，桌面图标照常可点可拖 |
 | | 锁定 | 完全不转发：壁纸只显示、不响应，点桌面不会误触它 |
 | 系统 | 开机自启 | 写 `HKCU\...\CurrentVersion\Run`，以设置文件为准自动纠正 |
 | | 关闭到托盘 | 点 × 只收进托盘 |
@@ -160,7 +160,11 @@ Unity 端零原生插件，一个 `UdpClient` 就行。
 > **输入系统的坑**：宿主转发鼠标靠合成窗口消息（`WM_MOUSEMOVE/WM_LBUTTONDOWN/...`），
 > 旧版 Input Manager 收得到，**新版 Input System 收不到**。所以壁纸工程要么用旧输入系统，
 > 要么干脆用 `MisideAudioLink.PointerNormalized` / `PointerLeft` —— 宿主把鼠标状态一并推过来了，
-> 和输入系统无关。键盘不用管：宿主把真实焦点给了壁纸窗口，两种输入系统都正常。
+> 和输入系统无关。键盘同样走合成消息（`WM_KEYDOWN/WM_KEYUP`），旧版 Input Manager 能收到；
+> 用新版 Input System 时请改读输入包里的指针状态，或用旧版输入系统。
+>
+> **宿主不抢前台焦点**：合成消息不需要焦点，所以桌面始终是前台窗口 ——
+> 桌面图标点击、拖动、右键菜单都不会被转发功能影响。
 
 详细的 Player Settings 解释、打包规则、按现象分类的排查清单、以及"我想自己写接收端"的最小代码，
 都在 [docs/unity-integration.md](docs/unity-integration.md)。
@@ -186,7 +190,7 @@ Unity 端零原生插件，一个 `UdpClient` 就行。
   │  library.rs   zip 导入（GBK 名回退 / zip-slip 防护）    │
   │  unity.rs     启动参数 / 挂起 / 音量 / 生命周期         │
   │  win/desktop  WorkerW 挂载 · 几何 · 显示器 · 缩略图抓取 │
-  │  win/input    鼠标钩子转发 + 焦点接管（可锁定）          │
+  │  win/input    鼠标/键盘钩子转发 + 捕获归还（可锁定）      │
   │  win/control  全屏/电池检测 · WASAPI 音量 · 自启        │
   │  audio_link   音频链路：UDP 三类包 + 输入包             │
   │  beat.rs      动态阈值节拍检测 + BPM 估计              │
@@ -204,7 +208,7 @@ Unity 端零原生插件，一个 `UdpClient` 就行。
 | `library.rs` | zip 导入/索引/删除/改名；UTF-8 优先、GBK 回退解码；绝对路径与 `..` 一律拒绝 |
 | `unity.rs` | Unity 启动参数、进程挂起/恢复、状态机、几何与音量同步 |
 | `win/desktop.rs` | WorkerW 发现（含 Win11 24H2 回退）、`SetParent`、坐标换算、显示器枚举、主窗口查找、`PrintWindow` 缩略图 |
-| `win/input.rs` | `WH_MOUSE_LL` 钩子 → 合成消息；焦点接管做键盘；只在桌面前台开闸 |
+| `win/input.rs` | `WH_MOUSE_LL` + `WH_KEYBOARD_LL` 钩子 → 合成窗口消息；归还被抢走的鼠标捕获；只在桌面前台开闸，不抢焦点 |
 | `win/control.rs` | `SHQueryUserNotificationState` 全屏判定、`GetSystemPowerStatus` 电池、WASAPI 会话音量、`NtSuspendProcess`、注册表自启、Job Object 进程归属、按 PID 杀进程 |
 | `audio_link.rs` | UDP 三类包发送 + 1Hz 状态广播 |
 | `beat.rs` | 低频能量动态阈值 onset 检测（按时间窗，不随帧率漂移）+ BPM 中位数估计 |
@@ -233,7 +237,9 @@ Unity 端零原生插件，一个 `UdpClient` 就行。
 * **音量在壁纸出声前设置不上去**：Unity 没产生音频会话时 WASAPI 找不到它，宿主会每 2 秒重试，
   界面显示的是你的目标值；
 * **输入转发只在桌面是前台时生效**（和 Lively 一样的规则）：否则全系统的鼠标移动都会涌进壁纸窗口；
-  键盘会真实抢焦点，接受不了就把转发关掉或打开「锁定」；
+  转发**不抢前台焦点**（桌面图标始终能点能拖）。壁纸窗口挂载时会被标成 `WS_EX_NOACTIVATE`，
+  它抢不走前台；合成鼠标按下会让壁纸窗口短暂拿到鼠标捕获，宿主会立刻把捕获还给桌面图标层，
+  停止转发时也会补发抬起消息并把捕获还回去 —— 所以开关转发不会把桌面图标「点死」；
 * **受保护内容与独占模式音频抓不到**，这是内核上游的限制；
 * **实时缩略图抓不到所有壁纸**：`PrintWindow` 对 DirectX 独占渲染的窗口常常只能拿到全黑帧
   （宿主按「抓不到」处理），这类壁纸用「预览」开独立窗口看；壁纸被暂停时宿主不会去抓

@@ -146,7 +146,10 @@ impl PauseDebounce {
 }
 
 /// 自动暂停前，条件需要持续成立多久。
-const PAUSE_HOLD: Duration = Duration::from_secs(3);
+///
+/// 窗口状态每 250ms 采样一次，保留 1 秒去抖以过滤 Alt+Tab 等瞬时状态，
+/// 同时避免用户等待数秒才看到暂停。
+const PAUSE_HOLD: Duration = Duration::from_secs(1);
 
 impl Default for UnityHost {
     fn default() -> Self {
@@ -692,7 +695,7 @@ mod tests {
         let start = Instant::now();
         assert!(!debounce.update(true, start), "刚满足条件不该立刻暂停");
         assert!(!debounce.update(true, start + Duration::from_millis(900)));
-        assert!(!debounce.update(false, start + Duration::from_millis(1000)), "条件没了就该解除");
+        assert!(!debounce.update(false, start + Duration::from_secs(1)), "条件没了就该解除");
         // 抖动过去后即使再满足，也要从头计时
         assert!(!debounce.update(true, start + Duration::from_millis(1100)));
         assert!(!debounce.update(true, start + Duration::from_millis(2000)));
@@ -703,10 +706,10 @@ mod tests {
         let mut debounce = PauseDebounce::new(PAUSE_HOLD);
         let start = Instant::now();
         assert!(!debounce.update(true, start));
-        assert!(!debounce.update(true, start + Duration::from_secs(2)));
-        assert!(debounce.update(true, start + Duration::from_secs(3)), "持续 3 秒后应当暂停");
-        assert!(debounce.update(true, start + Duration::from_secs(10)), "条件还在就保持暂停");
-        assert!(!debounce.update(false, start + Duration::from_secs(11)), "条件消失立刻恢复");
+        assert!(!debounce.update(true, start + Duration::from_millis(900)));
+        assert!(debounce.update(true, start + Duration::from_secs(1)), "持续 1 秒后应当暂停");
+        assert!(debounce.update(true, start + Duration::from_secs(2)), "条件还在就保持暂停");
+        assert!(!debounce.update(false, start + Duration::from_secs(3)), "条件消失立刻恢复");
     }
 
     #[test]

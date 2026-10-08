@@ -2056,7 +2056,7 @@ dependencies = [
 
 [[package]]
 name = "miside-wallpaper-engine"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "encoding_rs",
  "libloading 0.8.9",

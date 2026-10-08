@@ -32,7 +32,8 @@ use windows::Win32::UI::Shell::{
     SHQueryUserNotificationState, QUNS_BUSY, QUNS_PRESENTATION_MODE, QUNS_RUNNING_D3D_FULL_SCREEN,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetForegroundWindow, GetWindowThreadProcessId, IsIconic, IsWindowVisible,
+    GetForegroundWindow, GetWindowLongPtrW, GetWindowThreadProcessId, IsIconic, IsWindowVisible,
+    IsZoomed, GWL_STYLE, WS_MAXIMIZE,
 };
 
 use super::desktop;
@@ -82,9 +83,8 @@ pub fn is_fullscreen_running() -> bool {
                 if state == QUNS_BUSY {
                     return foreground_covers_monitor();
                 }
-                false
+                foreground_covers_monitor() && !foreground_is_maximized()
             }
-            // 查不到就当没有：宁可多跑一会儿壁纸，也不要无故暂停
             Err(_) => false,
         }
     }
@@ -103,29 +103,42 @@ pub fn foreground_covers_monitor() -> bool {
         if desktop::is_desktop_foreground() || desktop::is_wallpaper_window(foreground) {
             return false;
         }
-        // 宿主自己的设置窗口当然也不算"全屏应用"
         let mut pid = 0u32;
         GetWindowThreadProcessId(foreground, Some(&mut pid));
-        if pid == std::process::id() {
-            return false;
-        }
-        let Some(monitor) = desktop::monitor_of_window(foreground) else {
-            return false;
-        };
+        if pid == std::process::id() { return false; }
+        let Some(monitor) = desktop::monitor_of_window(foreground) else { return false; };
         let mut rect = windows::Win32::Foundation::RECT::default();
-        if windows::Win32::UI::WindowsAndMessaging::GetWindowRect(foreground, &mut rect).is_err() {
-            return false;
-        }
-        let width = rect.right - rect.left;
-        let height = rect.bottom - rect.top;
-        // 允许 2px 的边框误差
-        width >= monitor.width - 2 && height >= monitor.height - 2
+        if windows::Win32::UI::WindowsAndMessaging::GetWindowRect(foreground, &mut rect).is_err() { return false; }
+        rect.right - rect.left >= monitor.width - 2 && rect.bottom - rect.top >= monitor.height - 2
     }
 }
 
-/// 前台窗口是不是铺满了它所在的显示器（"前台最大化时暂停"这一项用的判定）。
+/// 前台窗口是否最大化。不能只依赖 IsZoomed：部分 WebView/无边框窗口
+/// 会保留 WS_MAXIMIZE 样式但 IsZoomed 返回 false。
+fn foreground_is_maximized() -> bool {
+    unsafe {
+        let foreground = GetForegroundWindow();
+        if foreground.is_invalid()
+            || !IsWindowVisible(foreground).as_bool()
+            || IsIconic(foreground).as_bool()
+            || desktop::is_desktop_foreground()
+            || desktop::is_wallpaper_window(foreground)
+        {
+            return false;
+        }
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(foreground, Some(&mut pid));
+        if pid == 0 || pid == std::process::id() {
+            return false;
+        }
+        let style = GetWindowLongPtrW(foreground, GWL_STYLE) as u32;
+        IsZoomed(foreground).as_bool() || (style & WS_MAXIMIZE.0) != 0
+    }
+}
+
+/// 前台窗口是否最大化（该设置不要求窗口正好铺满整个显示器）。
 pub fn is_foreground_fullscreen() -> bool {
-    foreground_covers_monitor()
+    foreground_is_maximized()
 }
 
 /// 是否正在用电池（台式机 / 查不到时为 false）。

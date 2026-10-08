@@ -163,7 +163,6 @@ export function createGeneralTab(): Tab {
   const pauseForeground = toggle(getSettings().pauseWhenForeground, (checked) =>
     patchSettings({ pauseWhenForeground: checked }),
   );
-
   const pauseBody = h(
     "div",
     {},

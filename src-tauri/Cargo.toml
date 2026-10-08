@@ -1,6 +1,6 @@
 [package]
 name = "miside-wallpaper-engine"
-version = "0.0.1"
+version = "0.0.2"
 description = "miside-wallpaper-engine：Unity exe 桌面壁纸宿主（压缩包导入、WorkerW 挂载、音频节奏推流）"
 authors = ["TouMingQAQ"]
 edition = "2021"

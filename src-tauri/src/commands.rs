@@ -31,7 +31,8 @@ pub const MONITOR_EVENT: &str = "wp://monitor";
 pub const LOG_EVENT: &str = "wp://log";
 
 /// 后台扫描周期。
-const SCAN_INTERVAL: Duration = Duration::from_millis(1200);
+// 状态检测需要足够快地响应窗口切换；音频采集自身有独立的节流逻辑。
+const SCAN_INTERVAL: Duration = Duration::from_millis(250);
 /// 起流失败后的退避：别每 1.2 秒重拉一次被独占的设备。
 const START_BACKOFF: Duration = Duration::from_secs(10);
 /// 内存里保留的日志条数。

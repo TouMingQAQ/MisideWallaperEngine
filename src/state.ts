@@ -398,6 +398,17 @@ export const store = {
     toast("info", t("about.logDirOpened"));
   },
 
+  /** 导出诊断日志；成功后返回保存路径，取消/失败返回 null */
+  async exportDiagnostics(): Promise<string | null> {
+    const res = await api.exportDiagnostics();
+    if (!res.ok) {
+      if (!res.canceled) reportFailure(res, t("about.exportLog"));
+      return null;
+    }
+    toast("info", t("about.logExported"));
+    return res.value;
+  },
+
   /** 立即保存（用于 autoStart 之类需要外部动作的项，实际仍走同一保存管线） */
   flushSave(): void {
     if (saveTimer !== null) {

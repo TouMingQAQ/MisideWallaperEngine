@@ -110,6 +110,12 @@ pub struct UnityHost {
     job: Option<control::KillOnCloseJob>,
     /// 自动暂停条件的去抖（见 [`PauseDebounce`]）。
     pause_debounce: PauseDebounce,
+    /// 桌面模式下，本窗口「还挂在壁纸层但被藏起来」的起始时刻（显示桌面 / Win+D 造成的）。
+    /// 用去抖排除「显示桌面」动画过程中的瞬时隐藏，稳定后才不抢前台地显示回来。
+    hidden_since: Option<Instant>,
+    /// 上一次尝试「从隐藏恢复」的时刻。用来限频：窗口若持续隐藏，不要每 200ms 反复
+    /// `ShowWindow` + 重排，否则本身就是新的抖动源。
+    last_desktop_restore: Option<Instant>,
     /// 当前自动暂停的原因（没暂停时为空串），日志与界面都用它回答"为什么停了"。
     pause_reason: String,
 }
@@ -151,6 +157,12 @@ impl PauseDebounce {
 /// 同时避免用户等待数秒才看到暂停。
 const PAUSE_HOLD: Duration = Duration::from_secs(1);
 
+/// 「显示桌面 / Win+D 把壁纸藏起来」后，要持续多久才重新显示。
+///
+/// 显示桌面本身有一个淡出动画，期间窗口会短暂不可见；太快去显示会和动画抢、造成闪。
+/// 取 200ms：比动画略长，又短到用户基本察觉不到壁纸"消失"。
+const SHOW_DESKTOP_HOLD: Duration = Duration::from_millis(200);
+
 impl Default for UnityHost {
     fn default() -> Self {
         Self {
@@ -164,6 +176,8 @@ impl Default for UnityHost {
             positioned: false,
             job: None,
             pause_debounce: PauseDebounce::new(PAUSE_HOLD),
+            hidden_since: None,
+            last_desktop_restore: None,
             pause_reason: String::new(),
         }
     }
@@ -206,7 +220,10 @@ impl UnityHost {
         self.stop();
 
         if !entry.is_runnable() {
-            return Err(format!("壁纸「{}」的主程序不见了，重新导入一次", entry.name));
+            return Err(format!(
+                "壁纸「{}」的主程序不见了，重新导入一次",
+                entry.name
+            ));
         }
         let exe = PathBuf::from(&entry.exe);
         let work_dir = exe
@@ -247,12 +264,19 @@ impl UnityHost {
 
         self.mode = mode;
         self.child = Some(child);
-        self.rect = (rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top);
+        self.rect = (
+            rect.left,
+            rect.top,
+            rect.right - rect.left,
+            rect.bottom - rect.top,
+        );
         self.applied_volume = None;
         self.applied_muted = None;
         self.positioned = false;
         // 新一次起流从干净状态开始：上一个壁纸留下的暂停条件不该顺延过来
         self.pause_debounce.reset();
+        self.hidden_since = None;
+        self.last_desktop_restore = None;
         self.pause_reason.clear();
         self.state = RuntimeState {
             mode: mode.as_str().to_string(),
@@ -318,6 +342,8 @@ impl UnityHost {
         self.applied_muted = None;
         self.positioned = false;
         self.pause_debounce.reset();
+        self.hidden_since = None;
+        self.last_desktop_restore = None;
         self.pause_reason.clear();
     }
 
@@ -389,7 +415,39 @@ impl UnityHost {
         // 3. 桌面模式：挂上 WorkerW；掉了就重挂（explorer 重启、Win+D 之类）
         if self.mode == Mode::Desktop {
             if let Some(hwnd) = self.hwnd() {
-                if !desktop::is_attached(hwnd) {
+                if desktop::hidden_on_desktop(hwnd) {
+                    // 还挂在壁纸层上，但被「显示桌面 / Win+D」藏起来了。
+                    //
+                    // Win11 的桌面是分层 + 提升的，显示桌面会把 WorkerW 这一层整体藏掉；
+                    // Win10 的老模型一般不参与，所以这个问题主要在 Win11 上碰到。
+                    //
+                    // 去抖：显示桌面有淡出动画，期间窗口会短暂不可见。等它稳定
+                    // SHOW_DESKTOP_HOLD 之后，再用 SW_SHOWNA 不抢前台地显示回来 ——
+                    // 用 SW_SHOW 可能把焦点从桌面图标层抢走。
+                    let now = Instant::now();
+                    let since = *self.hidden_since.get_or_insert(now);
+                    let cooled = self
+                        .last_desktop_restore
+                        .map(|t| now.duration_since(t) >= Duration::from_secs(1))
+                        .unwrap_or(true);
+                    if now.duration_since(since) >= SHOW_DESKTOP_HOLD && cooled {
+                        // 恢复时连几何一起重设：显示桌面多半是把窗口最小化了，
+                        // 只 ShowWindow 会还原成默认小尺寸并贴在左上角（高 DPI 屏上明显）。
+                        desktop::restore_on_desktop(hwnd, settings.monitor_index);
+                        self.hidden_since = None;
+                        self.last_desktop_restore = Some(now);
+                        self.state.attached = true;
+                        let rect = desktop::target_rect(settings.monitor_index);
+                        self.rect = (
+                            rect.left,
+                            rect.top,
+                            rect.right - rect.left,
+                            rect.bottom - rect.top,
+                        );
+                    }
+                } else if !desktop::is_attached(hwnd) {
+                    self.hidden_since = None;
+                    self.last_desktop_restore = None;
                     match desktop::attach(hwnd, settings.monitor_index) {
                         Ok(()) => {
                             self.state.attached = true;
@@ -405,13 +463,22 @@ impl UnityHost {
                         Err(err) => self.state.last_error = err,
                     }
                 } else {
+                    self.hidden_since = None;
+                    self.last_desktop_restore = None;
                     self.state.attached = true;
                     // 旧版本挂上去的窗口可能没有「不可激活」标记（那时候还没有这个设计），
                     // 补一次，否则它仍能当前台窗口、把桌面图标顶成非激活状态
                     desktop::enforce_no_activate(hwnd);
+                    // 补一次「显示桌面 / Peek 不淡出」标记（Win11 的显示桌面会把它藏起来）
+                    desktop::enforce_peek_excluded(hwnd);
                     // 显示器设置变了就按新几何摆一次（尺寸永远是整块屏，渲染倍率不在这里）
                     let rect = desktop::target_rect(settings.monitor_index);
-                    let wanted = (rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top);
+                    let wanted = (
+                        rect.left,
+                        rect.top,
+                        rect.right - rect.left,
+                        rect.bottom - rect.top,
+                    );
                     if wanted != self.rect {
                         self.rect = wanted;
                         let _ = desktop::move_window(hwnd, rect);
@@ -424,31 +491,44 @@ impl UnityHost {
             if !self.positioned {
                 let rect = preview_rect(settings);
                 if desktop::move_window(hwnd, rect).is_ok() {
-                    self.rect = (rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top);
+                    self.rect = (
+                        rect.left,
+                        rect.top,
+                        rect.right - rect.left,
+                        rect.bottom - rect.top,
+                    );
                     self.positioned = true;
                 }
             }
         }
 
         // 4. 暂停条件：先弄清"为什么"，日志里要能直接看出是谁按的暂停
+        //
+        // 与 Lively 一致的两层判定：
+        // * `pause_when_foreground`：只要前台不是桌面/壁纸（有应用在跑）就暂停；
+        // * `pause_on_fullscreen`：按 `pause_algorithm` 判定「有应用盖住了桌面」时暂停。
         let mut reason = "";
-        if settings.pause_on_fullscreen && system.fullscreen {
-            reason = "检测到全屏应用";
+        if settings.pause_on_fullscreen && system.covered {
+            reason = "检测到有应用盖住了桌面";
+        } else if settings.pause_when_foreground && system.foreground_app {
+            reason = "前台有应用在运行";
         } else if settings.pause_on_battery && system.on_battery {
             reason = "正在使用电池";
-        } else if settings.pause_when_foreground && system.foreground_fullscreen {
-            reason = "前台窗口铺满了屏幕";
+        } else if settings.pause_on_battery_saver && system.on_battery_saver {
+            reason = "电池节能模式已开启";
         }
 
         // 去抖：条件要持续成立才挂起，避免切窗口时外壳报忙把壁纸停一下
-        let auto = self.pause_debounce.update(!reason.is_empty(), Instant::now());
+        let auto = self
+            .pause_debounce
+            .update(!reason.is_empty(), Instant::now());
         if auto {
             self.pause_reason = reason.to_string();
         } else {
             self.pause_reason.clear();
         }
         self.state.auto_paused = auto && !self.state.user_paused;
-        self.state.occluded = system.fullscreen;
+        self.state.occluded = system.covered;
         let _ = self.apply_pause();
 
         // 5. 音量 / 静音（会话还没出现就过两秒再试）
@@ -477,9 +557,8 @@ impl UnityHost {
         self.state.muted = settings.muted;
 
         // 6. 输入转发
-        let forwarding = settings.input_forward
-            && !settings.input_locked
-            && self.mode == Mode::Desktop;
+        let forwarding =
+            settings.input_forward && !settings.input_locked && self.mode == Mode::Desktop;
         if forwarding {
             if let Some(hwnd) = self.hwnd() {
                 let _ = crate::win::input::set_target(hwnd.0 as isize, true, true);
@@ -500,7 +579,11 @@ impl UnityHost {
 /// **窗口尺寸永远是整块显示器**：渲染倍率不走这里 —— 把窗口改小只会让壁纸缩在屏幕左上角，
 /// 正确的做法是窗口照旧铺满、由 Unity 端用 `ScalableBufferManager.ResizeBuffers` 降内部分辨率，
 /// 所以倍率是通过配置包下发的（见 `audio_link::config_json` 的 `renderScale`）。
-pub fn build_args(settings: &Settings, mode: Mode, rect: windows::Win32::Foundation::RECT) -> Vec<String> {
+pub fn build_args(
+    settings: &Settings,
+    mode: Mode,
+    rect: windows::Win32::Foundation::RECT,
+) -> Vec<String> {
     let mut width = (rect.right - rect.left).max(320);
     let mut height = (rect.bottom - rect.top).max(240);
     if mode != Mode::Desktop {
@@ -612,9 +695,15 @@ mod tests {
         };
         let args = build_args(&settings, Mode::Desktop, rect(1920, 1080));
         assert!(args.contains(&"-popupwindow".to_string()));
-        let width_at = args.iter().position(|a| a == "-screen-width").expect("width");
+        let width_at = args
+            .iter()
+            .position(|a| a == "-screen-width")
+            .expect("width");
         assert_eq!(args[width_at + 1], "1920");
-        let height_at = args.iter().position(|a| a == "-screen-height").expect("height");
+        let height_at = args
+            .iter()
+            .position(|a| a == "-screen-height")
+            .expect("height");
         assert_eq!(args[height_at + 1], "1080");
         // 用户附加参数原样跟在后面
         assert!(args.contains(&"--foo".to_string()));
@@ -627,14 +716,20 @@ mod tests {
         assert!(!auto.iter().any(|a| a.starts_with("-force-d3d")));
 
         let d11 = build_args(
-            &Settings { graphics_api: "d3d11".into(), ..Default::default() },
+            &Settings {
+                graphics_api: "d3d11".into(),
+                ..Default::default()
+            },
             Mode::Desktop,
             rect(1920, 1080),
         );
         assert!(d11.contains(&"-force-d3d11".to_string()));
 
         let d12 = build_args(
-            &Settings { graphics_api: "d3d12".into(), ..Default::default() },
+            &Settings {
+                graphics_api: "d3d12".into(),
+                ..Default::default()
+            },
             Mode::Desktop,
             rect(1920, 1080),
         );
@@ -650,19 +745,26 @@ mod tests {
         };
         let args = build_args(&settings, Mode::Desktop, rect(1920, 1080));
         let ours = args.iter().position(|a| a == "-force-d3d12").expect("ours");
-        let theirs = args.iter().position(|a| a == "-force-d3d11").expect("theirs");
+        let theirs = args
+            .iter()
+            .position(|a| a == "-force-d3d11")
+            .expect("theirs");
         assert!(theirs > ours, "用户自己写的参数应当排在后面（后写的生效）");
     }
 
     #[test]
-    fn preview_args_use_the_preview_size_and_stay_windowed() {        let settings = Settings {
+    fn preview_args_use_the_preview_size_and_stay_windowed() {
+        let settings = Settings {
             preview_width: 800,
             preview_height: 450,
             ..Default::default()
         };
         let args = build_args(&settings, Mode::Preview, rect(1920, 1080));
         assert!(!args.contains(&"-popupwindow".to_string()));
-        let width_at = args.iter().position(|a| a == "-screen-width").expect("width");
+        let width_at = args
+            .iter()
+            .position(|a| a == "-screen-width")
+            .expect("width");
         assert_eq!(args[width_at + 1], "800");
         assert_eq!(args[0], "-screen-fullscreen");
         assert_eq!(args[1], "0");
@@ -672,7 +774,10 @@ mod tests {
     fn a_degenerate_rect_still_produces_a_usable_window() {
         let settings = Settings::default();
         let args = build_args(&settings, Mode::Desktop, rect(0, 0));
-        let width_at = args.iter().position(|a| a == "-screen-width").expect("width");
+        let width_at = args
+            .iter()
+            .position(|a| a == "-screen-width")
+            .expect("width");
         assert!(args[width_at + 1].parse::<i32>().unwrap() >= 320);
     }
 
@@ -695,7 +800,10 @@ mod tests {
         let start = Instant::now();
         assert!(!debounce.update(true, start), "刚满足条件不该立刻暂停");
         assert!(!debounce.update(true, start + Duration::from_millis(900)));
-        assert!(!debounce.update(false, start + Duration::from_secs(1)), "条件没了就该解除");
+        assert!(
+            !debounce.update(false, start + Duration::from_secs(1)),
+            "条件没了就该解除"
+        );
         // 抖动过去后即使再满足，也要从头计时
         assert!(!debounce.update(true, start + Duration::from_millis(1100)));
         assert!(!debounce.update(true, start + Duration::from_millis(2000)));
@@ -707,9 +815,18 @@ mod tests {
         let start = Instant::now();
         assert!(!debounce.update(true, start));
         assert!(!debounce.update(true, start + Duration::from_millis(900)));
-        assert!(debounce.update(true, start + Duration::from_secs(1)), "持续 1 秒后应当暂停");
-        assert!(debounce.update(true, start + Duration::from_secs(2)), "条件还在就保持暂停");
-        assert!(!debounce.update(false, start + Duration::from_secs(3)), "条件消失立刻恢复");
+        assert!(
+            debounce.update(true, start + Duration::from_secs(1)),
+            "持续 1 秒后应当暂停"
+        );
+        assert!(
+            debounce.update(true, start + Duration::from_secs(2)),
+            "条件还在就保持暂停"
+        );
+        assert!(
+            !debounce.update(false, start + Duration::from_secs(3)),
+            "条件消失立刻恢复"
+        );
     }
 
     #[test]

@@ -12,11 +12,10 @@ use std::sync::Mutex;
 
 use serde::Serialize;
 use windows::core::{w, BOOL, PCWSTR};
-use windows::Win32::Foundation::{
-    GetLastError, HWND, LPARAM, POINT, RECT, TRUE, WPARAM,
-};
+use windows::Win32::Foundation::{GetLastError, HWND, LPARAM, POINT, RECT, TRUE, WPARAM};
 use windows::Win32::Graphics::Dwm::{
-    DwmSetWindowAttribute, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND,
+    DwmSetWindowAttribute, DWMWA_EXCLUDED_FROM_PEEK, DWMWA_WINDOW_CORNER_PREFERENCE,
+    DWMWCP_DONOTROUND,
 };
 use windows::Win32::Graphics::Gdi::{
     ClientToScreen, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject,
@@ -25,7 +24,12 @@ use windows::Win32::Graphics::Gdi::{
     BI_RGB, DIB_RGB_COLORS, HALFTONE, HDC, HGDIOBJ, HMONITOR, MONITORINFOEXW,
     MONITOR_DEFAULTTONEAREST, SRCCOPY,
 };
-use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
+use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
+use windows::Win32::System::SystemInformation::OSVERSIONINFOW;
+use windows::Win32::UI::HiDpi::{
+    GetAwarenessFromDpiAwarenessContext, GetDpiForMonitor, GetDpiForSystem,
+    GetThreadDpiAwarenessContext, MDT_EFFECTIVE_DPI,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, FindWindowExW, FindWindowW, GetAncestor, GetClassNameW, GetClientRect,
     GetForegroundWindow, GetGUIThreadInfo, GetParent, GetShellWindow, GetSystemMetrics,
@@ -33,8 +37,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     IsWindowVisible, SendMessageTimeoutW, SetParent, SetWindowLongPtrW, SetWindowPos, ShowWindow,
     GA_ROOT, GUITHREADINFO, GWL_EXSTYLE, GWL_STYLE, HWND_TOP, SMTO_NORMAL, SM_CXVIRTUALSCREEN,
     SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SWP_FRAMECHANGED, SWP_NOACTIVATE,
-    SWP_SHOWWINDOW, SW_SHOW, WS_CAPTION, WS_CHILD, WS_EX_APPWINDOW, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU, WS_THICKFRAME,
+    SWP_SHOWWINDOW, SW_SHOW, SW_SHOWNOACTIVATE, WS_CAPTION, WS_CHILD, WS_EX_APPWINDOW,
+    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU,
+    WS_THICKFRAME,
 };
 
 // `windows` crate 把 `PrintWindow` 的元数据归到了 `Win32::Storage::Xps` 下（元数据归类如此），
@@ -67,6 +72,13 @@ pub struct MonitorInfo {
 /// 记录上一次挂载的窗口，供重挂时判断。
 static ATTACHED: Mutex<Option<isize>> = Mutex::new(None);
 
+/// 挂载时最终选定的那个 WorkerW。**挂上之后就以它为准**，不再每帧重新 `find_worker_w()`。
+///
+/// 这是修复「点显示桌面/回主界面后壁纸在多个 WorkerW 之间反复重挂、缩成左上角」的关键：
+/// 机器上可能存在多个 WorkerW，每次解析都可能挑到不同的那个，于是窗口被反复 SetParent。
+/// 存住一次性选定的句柄后，只有它被销毁（explorer 重启等）才会重新解析。
+static ATTACHED_WORKER: Mutex<Option<isize>> = Mutex::new(None);
+
 fn last_error(context: &str) -> String {
     let code = unsafe { GetLastError() };
     format!("{context} 失败（Win32 错误 {}）", code.0)
@@ -80,6 +92,15 @@ fn find_ex(parent: Option<HWND>, after: Option<HWND>, class: PCWSTR) -> HWND {
 /* ------------------------------------------------------------- WorkerW */
 
 /// 找到桌面壁纸层（WorkerW）。找不到时返回 `None`，调用方可以过一会儿再试。
+///
+/// 注意：Win10/11 上可能同时存在**多个** WorkerW（桌面图标层那个、壁纸层那个，以及 Win11
+/// raised desktop 里挂在 `Progman` 下的那个）。如果每次都随便挑一个，壁纸会被在几个 WorkerW
+/// 之间来回 `SetParent`，导致闪烁甚至画面重排。实测（2560×1440 机器）就出现过：点"显示桌面/
+/// 回主界面"时，壁纸窗口的父窗口在一个可见 WorkerW（0x10f15ec）和一个隐藏 WorkerW
+/// （0x20a19b0）之间来回横跳，Unity 每次重排后把画面缩成一小块贴在左上角。
+///
+/// 所以这里收集全部候选，**优先选可见、面积最大（覆盖屏幕）的那个**；真正挂载后由
+/// `ATTACHED_WORKER` 记住它，之后不再每帧重新解析。
 pub fn find_worker_w() -> Option<HWND> {
     unsafe {
         let progman = FindWindowW(w!("Progman"), PCWSTR::null()).ok()?;
@@ -100,35 +121,69 @@ pub fn find_worker_w() -> Option<HWND> {
                 None,
             );
 
-            let mut found: HWND = HWND::default();
+            let mut candidates: Vec<HWND> = Vec::new();
             let _ = EnumWindows(
-                Some(enum_for_worker),
-                LPARAM(&mut found as *mut HWND as isize),
+                Some(enum_collect_workers),
+                LPARAM(&mut candidates as *mut Vec<HWND> as isize),
             );
-            if !found.is_invalid() {
-                return Some(found);
+            // Windows 11 24H2+：WorkerW 成了 Progman 的子窗口（可能不止一个）
+            let mut child = find_ex(Some(progman), Some(HWND::default()), w!("WorkerW"));
+            while !child.is_invalid() {
+                candidates.push(child);
+                child = find_ex(Some(progman), Some(child), w!("WorkerW"));
             }
 
-            // Windows 11 24H2+：WorkerW 成了 Progman 的子窗口
-            let child = find_ex(Some(progman), Some(HWND::default()), w!("WorkerW"));
-            if !child.is_invalid() {
-                return Some(child);
+            if let Some(best) = pick_best_worker(&candidates) {
+                return Some(best);
             }
         }
         None
     }
 }
 
-unsafe extern "system" fn enum_for_worker(window: HWND, reference: LPARAM) -> BOOL {
-    // 有 SHELLDLL_DefView 子窗口的那个顶层窗口，它后面紧跟着的兄弟 WorkerW 就是壁纸层
+/// 收集「顶层窗口里、紧跟在挂着 SHELLDLL_DefView 的那个窗口之后的 WorkerW」。
+unsafe extern "system" fn enum_collect_workers(window: HWND, reference: LPARAM) -> BOOL {
+    let candidates = &mut *(reference.0 as *mut Vec<HWND>);
     let view = find_ex(Some(window), Some(HWND::default()), w!("SHELLDLL_DefView"));
     if !view.is_invalid() {
         let worker = find_ex(Some(HWND::default()), Some(window), w!("WorkerW"));
         if !worker.is_invalid() {
-            *(reference.0 as *mut HWND) = worker;
+            candidates.push(worker);
         }
     }
     TRUE
+}
+
+/// 从候选里挑壁纸层：优先**可见**的、面积最大的那个（壁纸层基本铺满虚拟屏幕）；
+/// 都不可见时退回面积最大的。避免挑到被显示桌面藏起来的那个 WorkerW。
+fn pick_best_worker(candidates: &[HWND]) -> Option<HWND> {
+    fn area(hwnd: HWND) -> i64 {
+        if hwnd.is_invalid() {
+            return 0;
+        }
+        unsafe {
+            let mut rect = RECT::default();
+            if GetWindowRect(hwnd, &mut rect).is_err() {
+                return 0;
+            }
+            ((rect.right - rect.left) as i64) * ((rect.bottom - rect.top) as i64)
+        }
+    }
+    fn visible(hwnd: HWND) -> bool {
+        !hwnd.is_invalid() && unsafe { IsWindowVisible(hwnd).as_bool() }
+    }
+
+    let mut best: Option<HWND> = None;
+    let mut best_score: i64 = -1;
+    for &candidate in candidates {
+        // 可见给一个极大的加成，其次比面积
+        let score = area(candidate) + if visible(candidate) { 1_000_000_000_000 } else { 0 };
+        if score > best_score {
+            best_score = score;
+            best = Some(candidate);
+        }
+    }
+    best.filter(|h| !h.is_invalid())
 }
 
 /* --------------------------------------------------------------- 挂载 */
@@ -176,6 +231,19 @@ pub fn attach(hwnd: HWND, monitor_index: i32) -> Result<(), String> {
             &preference as *const _ as *const c_void,
             std::mem::size_of_val(&preference) as u32,
         );
+        // 3.1 让「显示桌面 / Aero Peek」不要把壁纸窗口淡出成玻璃。
+        //
+        // 官方定义（DWMWA_EXCLUDED_FROM_PEEK）：TRUE 时，别的窗口触发 peek 预览时本窗口
+        // **不**淡出（fade to a glass sheet）。Win11 的桌面是「分层 + 提升」的（raised desktop），
+        // 挂在上面的壁纸会被显示桌面 / 鼠标悬停「显示桌面」按钮一起藏掉；Win10 的老 WorkerW
+        // 模型不参与这套，所以这个问题只在 Win11 上出现。设了这个属性后，显示桌面时壁纸保持可见。
+        let exclude_peek = TRUE;
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_EXCLUDED_FROM_PEEK,
+            &exclude_peek as *const _ as *const c_void,
+            std::mem::size_of_val(&exclude_peek) as u32,
+        );
 
         // 4. 铺满目标区域（坐标要换算成父窗口客户区）
         let rect = target_rect(monitor_index);
@@ -195,6 +263,7 @@ pub fn attach(hwnd: HWND, monitor_index: i32) -> Result<(), String> {
     }
 
     *ATTACHED.lock().unwrap_or_else(|e| e.into_inner()) = Some(hwnd.0 as isize);
+    *ATTACHED_WORKER.lock().unwrap_or_else(|e| e.into_inner()) = Some(worker.0 as isize);
     Ok(())
 }
 
@@ -235,6 +304,7 @@ pub fn detach(hwnd: HWND) -> Result<(), String> {
         .ok();
     }
     *ATTACHED.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    *ATTACHED_WORKER.lock().unwrap_or_else(|e| e.into_inner()) = None;
     Ok(())
 }
 
@@ -255,30 +325,268 @@ pub fn enforce_no_activate(hwnd: HWND) -> bool {
         if ex_style & WS_EX_NOACTIVATE.0 as isize != 0 {
             return false;
         }
-        SetWindowLongPtrW(
-            hwnd,
-            GWL_EXSTYLE,
-            ex_style | WS_EX_NOACTIVATE.0 as isize,
-        );
+        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex_style | WS_EX_NOACTIVATE.0 as isize);
     }
     true
 }
 
-/// 记在案的目标窗口是否还挂在壁纸层上。
+/// 记在案的目标窗口是否还挂在壁纸层上、并且**还看得见**。
+///
+/// 只比父窗口是不够的：Win11 的「显示桌面」（右下角按钮 / `Win+D`）会把桌面层一起藏起来，
+/// 窗口虽然还挂在 WorkerW 下，却已经 `IsWindowVisible == false` / 被最小化。
+/// 这种「挂在上面但看不见」必须当作脱层处理，否则调用方会以为一切正常、不去把它显示回来。
 pub fn is_attached(hwnd: HWND) -> bool {
     if hwnd.is_invalid() || !unsafe { IsWindow(Some(hwnd)).as_bool() } {
         return false;
     }
     unsafe {
+        // 被显示桌面藏起来 / 最小化：不算「挂着」，让调用方重新显示
+        if !IsWindowVisible(hwnd).as_bool() || IsIconic(hwnd).as_bool() {
+            return false;
+        }
         let parent = GetParent(hwnd).unwrap_or_default();
         if parent.is_invalid() {
             return false;
         }
-        // explorer 重启后 WorkerW 会被销毁重建，父窗口对不上就说明掉下来了
-        match find_worker_w() {
+        // 以**挂载时记下的** WorkerW 为准（不再每帧重新解析，避免在多个 WorkerW 间抖动）；
+        // 它若已被销毁（explorer 重启），才算掉下来，让调用方重新挂载。
+        match pinned_worker() {
             Some(worker) => parent == worker,
             None => false,
         }
+    }
+}
+
+/// 取挂载时记下的 WorkerW；句柄已失效（窗口没了）时返回 `None`。
+fn pinned_worker() -> Option<HWND> {
+    let stored = { *ATTACHED_WORKER.lock().unwrap_or_else(|e| e.into_inner()) };
+    let stored = stored?;
+    let hwnd = HWND(stored as *mut c_void);
+    if hwnd.is_invalid() || !unsafe { IsWindow(Some(hwnd)).as_bool() } {
+        return None;
+    }
+    Some(hwnd)
+}
+
+/// 壁纸窗口是否仍在壁纸层（父窗口是 WorkerW），但已经被隐藏 / 最小化。
+///
+/// 这专门用来识别「显示桌面 / Win+D 把壁纸藏起来了」。它和 `is_attached` 互斥：
+/// 前者只关心「还挂在层上但看不见」，用来在去抖稳定后把窗口**不抢前台**地显示回来。
+pub fn hidden_on_desktop(hwnd: HWND) -> bool {
+    if hwnd.is_invalid() || !unsafe { IsWindow(Some(hwnd)).as_bool() } {
+        return false;
+    }
+    unsafe {
+        if IsWindowVisible(hwnd).as_bool() && !IsIconic(hwnd).as_bool() {
+            return false;
+        }
+        let parent = GetParent(hwnd).unwrap_or_default();
+        if parent.is_invalid() {
+            return false;
+        }
+        // 只认挂载时记下的那个 WorkerW（同 `is_attached`，避免多 WorkerW 抖动）
+        matches!(pinned_worker(), Some(worker) if parent == worker)
+    }
+}
+
+/// 把窗口显示回来，但**不抢前台**（`SW_SHOWNA`）。
+///
+/// 显示桌面结束后用它恢复壁纸：用 `SW_SHOW` 会激活窗口，可能把焦点从桌面图标层抢走；
+/// `SW_SHOWNA` 只在当前位置显示、不改激活状态，正好符合壁纸「只显示、不响应」的定位。
+pub fn show_no_activate(hwnd: HWND) {
+    if hwnd.is_invalid() {
+        return;
+    }
+    unsafe {
+        let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+    }
+}
+
+/// 「显示桌面 / Win+D」把壁纸藏起来之后恢复它：先无激活地显示，再按目标显示器重新铺满。
+///
+/// 只 `ShowWindow` 而不重设尺寸是不够的 —— 显示桌面很可能把窗口**最小化**了，
+/// 恢复时 Windows 用的是它「还原尺寸/默认尺寸」，于是壁纸会缩成一小块贴在左上角
+/// （高 DPI 屏、比如 2560×1600@200% 上尤其明显：会缩成 1280×800）。所以这里顺手把
+/// 几何按 `target_rect(monitor_index)` 重新摆一遍。
+pub fn restore_on_desktop(hwnd: HWND, monitor_index: i32) {
+    if hwnd.is_invalid() {
+        return;
+    }
+    unsafe {
+        let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+    }
+    let rect = target_rect(monitor_index);
+    let _ = move_window(hwnd, rect);
+}
+
+/// 用一行文本描述某个窗口的几何与状态，供日志排查（几何变化、显示桌面恢复等）。
+///
+/// `hwnd` 传 isize，避免调用方（commands）为了构造 `HWND` 去引入 windows crate。
+pub fn window_geometry_summary(hwnd: isize) -> String {
+    let hwnd = HWND(hwnd as *mut c_void);
+    if hwnd.is_invalid() || !unsafe { IsWindow(Some(hwnd)).as_bool() } {
+        return "窗口无效".to_string();
+    }
+    unsafe {
+        let mut class_buf = [0u16; 64];
+        let n = GetClassNameW(hwnd, &mut class_buf);
+        let class = if n > 0 {
+            String::from_utf16_lossy(&class_buf[..n as usize])
+        } else {
+            String::new()
+        };
+        let parent = GetParent(hwnd).unwrap_or_default();
+        let parent_class = {
+            let mut pb = [0u16; 64];
+            let pn = if parent.is_invalid() {
+                0
+            } else {
+                GetClassNameW(parent, &mut pb)
+            };
+            if pn > 0 {
+                String::from_utf16_lossy(&pb[..pn as usize])
+            } else {
+                String::new()
+            }
+        };
+        let mut wr = RECT::default();
+        let has_rect = GetWindowRect(hwnd, &mut wr).is_ok();
+        let (cw, ch) = client_size(hwnd);
+        let monitor = monitor_of_window(hwnd)
+            .map(|m| format!("{}x{}@{}x", m.width, m.height, m.scale_factor))
+            .unwrap_or_else(|| "?".to_string());
+        format!(
+            "class={class} hwnd=0x{:x} parent=0x{:x}({parent_class}) rect={} client={}x{} visible={} iconic={} monitor={}",
+            hwnd.0 as isize,
+            parent.0 as isize,
+            if has_rect {
+                format!("({},{},{},{})", wr.left, wr.top, wr.right, wr.bottom)
+            } else {
+                "?".to_string()
+            },
+            cw,
+            ch,
+            IsWindowVisible(hwnd).as_bool(),
+            IsIconic(hwnd).as_bool(),
+            monitor,
+        )
+    }
+}
+
+/// 桌面层（WorkerW / Progman）的句柄与几何，供日志排查。
+pub fn desktop_layer_summary() -> String {
+    unsafe {
+        let progman = FindWindowW(w!("Progman"), PCWSTR::null()).unwrap_or_default();
+        let worker = find_worker_w().unwrap_or_default();
+        let rect = |h: HWND| {
+            let mut r = RECT::default();
+            if !h.is_invalid() && GetWindowRect(h, &mut r).is_ok() {
+                format!("({},{},{},{})", r.left, r.top, r.right, r.bottom)
+            } else {
+                "?".to_string()
+            }
+        };
+        format!(
+            "Progman=0x{:x}{} WorkerW=0x{:x}{}",
+            progman.0 as isize,
+            rect(progman),
+            worker.0 as isize,
+            rect(worker),
+        )
+    }
+}
+
+/// 整个虚拟桌面（所有显示器并集）的屏幕矩形 `(x, y, width, height)`。
+pub fn virtual_screen_rect() -> (i32, i32, i32, i32) {
+    unsafe {
+        (
+            GetSystemMetrics(SM_XVIRTUALSCREEN),
+            GetSystemMetrics(SM_YVIRTUALSCREEN),
+            GetSystemMetrics(SM_CXVIRTUALSCREEN),
+            GetSystemMetrics(SM_CYVIRTUALSCREEN),
+        )
+    }
+}
+
+/// 用 ntdll 的 `RtlGetVersion` 取真实系统版本（`GetVersionExW` 会因清单问题谎报）。
+/// 返回是否成功。
+fn rtl_get_version(info: &mut OSVERSIONINFOW) -> Option<bool> {
+    type RtlGetVersionFn = unsafe extern "system" fn(*mut OSVERSIONINFOW) -> i32;
+    unsafe {
+        let module = GetModuleHandleW(w!("ntdll.dll")).ok()?;
+        let proc = GetProcAddress(module, windows::core::s!("RtlGetVersion"))?;
+        let address = proc as usize;
+        let function: RtlGetVersionFn = std::mem::transmute(address);
+        Some(function(info) == 0)
+    }
+}
+
+/// 一份给排查用的系统环境摘要（Windows 版本、进程 DPI 感知、系统 DPI、虚拟屏幕、显示器、桌面层）。
+///
+/// 这些正是「壁纸缩小到左上角」这类 DPI / 几何问题的关键证据：如果进程 DPI 感知是
+/// 0（unaware）/1（system）而不是 2（per-monitor），那么 `monitors()` 拿到的可能是被
+/// 系统虚拟化后的逻辑分辨率（如 2560×1600@200% 被当成 1280×800），铺满自然就错了。
+pub fn system_diagnostics() -> String {
+    let mut out = String::new();
+    unsafe {
+        // 用 RtlGetVersion 取真实版本：GetVersionExW 在清单没声明 supportedOS 时
+        // 会谎报成 6.2 build 9200（Windows 8），会让诊断报告失真。
+        let mut info = OSVERSIONINFOW {
+            dwOSVersionInfoSize: std::mem::size_of::<OSVERSIONINFOW>() as u32,
+            ..Default::default()
+        };
+        let version_ok = rtl_get_version(&mut info).unwrap_or(false);
+        if version_ok {
+            out.push_str(&format!(
+                "Windows: {}.{} build {}\n",
+                info.dwMajorVersion, info.dwMinorVersion, info.dwBuildNumber
+            ));
+        } else {
+            out.push_str("Windows: 未知\n");
+        }
+        let awareness = GetAwarenessFromDpiAwarenessContext(GetThreadDpiAwarenessContext());
+        out.push_str(&format!(
+            "进程 DPI 感知: {}（0=unaware,1=system,2=per-monitor）  系统 DPI: {}\n",
+            awareness.0,
+            GetDpiForSystem()
+        ));
+        let (vl, vt, vw, vh) = virtual_screen_rect();
+        out.push_str(&format!("虚拟屏幕: x={vl} y={vt} {vw}x{vh}\n"));
+    }
+    out.push_str("--- 显示器 ---\n");
+    for m in monitors() {
+        out.push_str(&format!(
+            "[{}] {} {} {}x{} @{}x pos=({},{})\n",
+            m.index,
+            if m.name.is_empty() { "?" } else { &m.name },
+            if m.primary { "primary" } else { "secondary" },
+            m.width,
+            m.height,
+            m.scale_factor,
+            m.x,
+            m.y
+        ));
+    }
+    out.push_str(&format!("--- 桌面层 ---\n{}\n", desktop_layer_summary()));
+    out
+}
+
+/// 每轮扫描补一次「Peek 排除」标记。
+///
+/// 理由同 `enforce_no_activate`：属性可能因为重挂、explorer 重建等被重置。
+/// 成本只是一次 `DwmSetWindowAttribute`，可以忽略。
+pub fn enforce_peek_excluded(hwnd: HWND) {
+    if hwnd.is_invalid() {
+        return;
+    }
+    let exclude_peek = TRUE;
+    unsafe {
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_EXCLUDED_FROM_PEEK,
+            &exclude_peek as *const _ as *const c_void,
+            std::mem::size_of_val(&exclude_peek) as u32,
+        );
     }
 }
 
@@ -500,9 +808,15 @@ pub fn find_main_window(pid: u32) -> Option<HWND> {
         return None;
     }
     let mut best: Option<(HWND, i64)> = None;
-    let mut context = FindContext { pid, best: &mut best };
+    let mut context = FindContext {
+        pid,
+        best: &mut best,
+    };
     unsafe {
-        let _ = EnumWindows(Some(enum_main_window), LPARAM(&mut context as *mut _ as isize));
+        let _ = EnumWindows(
+            Some(enum_main_window),
+            LPARAM(&mut context as *mut _ as isize),
+        );
     }
     best.map(|(hwnd, _)| hwnd)
 }
@@ -569,7 +883,11 @@ pub fn is_desktop_foreground() -> bool {
             return false;
         }
         // 桌面图标层（SHELLDLL_DefView）本身也可能是前台窗口
-        let view = find_ex(Some(foreground), Some(HWND::default()), w!("SHELLDLL_DefView"));
+        let view = find_ex(
+            Some(foreground),
+            Some(HWND::default()),
+            w!("SHELLDLL_DefView"),
+        );
         if !view.is_invalid() {
             return true;
         }
@@ -581,6 +899,27 @@ pub fn is_desktop_foreground() -> bool {
         }
         let class = String::from_utf16_lossy(&buffer[..length as usize]);
         matches!(class.as_str(), "Progman" | "WorkerW")
+    }
+}
+
+/// 这个窗口本身是不是桌面外壳（Progman / WorkerW / 桌面图标层 `SHELLDLL_DefView`）。
+///
+/// 与 `is_desktop_foreground` 的区别：那个判断的是「**前台**是不是桌面」，这里只判断
+/// 「传来的这个窗口句柄是不是桌面层」，用于遍历窗口时把桌面层排除出「覆盖了屏幕的应用」。
+pub fn is_desktop_window(hwnd: HWND) -> bool {
+    unsafe {
+        if hwnd.is_invalid() {
+            return false;
+        }
+        let mut buffer = [0u16; 64];
+        let length = GetClassNameW(hwnd, &mut buffer);
+        if length <= 0 {
+            return false;
+        }
+        let class = String::from_utf16_lossy(&buffer[..length as usize]);
+        // 只比对顶层类名：桌面图标列表 SysListView32 是 DefView 的子窗口，
+        // EnumWindows 只枚举顶层窗口，不会碰到它，这里无需再管。
+        matches!(class.as_str(), "Progman" | "WorkerW" | "SHELLDLL_DefView")
     }
 }
 
@@ -734,7 +1073,11 @@ pub fn capture_thumbnail(hwnd: HWND, max_width: i32) -> Option<Thumbnail> {
         let thumb_dc = CreateCompatibleDC(Some(screen));
         let full_bitmap = CreateCompatibleBitmap(screen, width, height);
         let thumb_bitmap = CreateCompatibleBitmap(screen, thumb_width, thumb_height);
-        if full_dc.is_invalid() || thumb_dc.is_invalid() || full_bitmap.is_invalid() || thumb_bitmap.is_invalid() {
+        if full_dc.is_invalid()
+            || thumb_dc.is_invalid()
+            || full_bitmap.is_invalid()
+            || thumb_bitmap.is_invalid()
+        {
             let _ = ReleaseDC(None, screen);
             return None;
         }
@@ -746,7 +1089,16 @@ pub fn capture_thumbnail(hwnd: HWND, max_width: i32) -> Option<Thumbnail> {
         let _ = SetStretchBltMode(thumb_dc, HALFTONE);
         let stretched = if printed {
             StretchBlt(
-                thumb_dc, 0, 0, thumb_width, thumb_height, Some(full_dc), 0, 0, width, height,
+                thumb_dc,
+                0,
+                0,
+                thumb_width,
+                thumb_height,
+                Some(full_dc),
+                0,
+                0,
+                width,
+                height,
                 SRCCOPY,
             )
             .as_bool()

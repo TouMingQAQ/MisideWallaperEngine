@@ -102,9 +102,22 @@ pub struct Settings {
     pub graphics_api: String,
 
     /* ------------------------------------------------------------- 行为 */
+    /// 全屏暂停总开关。命中（按 `pause_algorithm` 判定「有应用盖住屏幕」，或
+    /// `pause_when_foreground` 命中的前台应用）时挂起壁纸。
     pub pause_on_fullscreen: bool,
+    /// 电池供电时暂停。
     pub pause_on_battery: bool,
+    /// 电池节能模式（Battery Saver）开启时暂停。
+    pub pause_on_battery_saver: bool,
+    /// 「前台有应用（非桌面、非壁纸）就暂停」——`pause_on_fullscreen` 的细化项，
+    /// 对齐 Lively 的 AppFocusPause：它只在全屏暂停开启时起作用。
     pub pause_when_foreground: bool,
+    /// 全屏 / 遮挡检测算法（对齐 Lively 的 ProcessMonitorAlgorithm）：
+    /// * `grid`（默认，推荐）：把显示器切成 50px 网格，多个窗口**拼起来**盖满 ≥95% 才算遮挡；
+    /// * `foreground`：只看前台窗口，它最大化或 ≥95% 显示器才算遮挡；
+    /// * `all`：任一可见窗口最大化或 ≥95% 显示器就算遮挡；
+    /// * `gamemode`：只用系统 `SHQueryUserNotificationState` 判独占全屏游戏。
+    pub pause_algorithm: String,
 
     /* ------------------------------------------------------------- 输入 */
     pub input_forward: bool,
@@ -160,7 +173,9 @@ impl Default for Settings {
 
             pause_on_fullscreen: true,
             pause_on_battery: false,
+            pause_on_battery_saver: false,
             pause_when_foreground: false,
+            pause_algorithm: "grid".to_string(),
 
             input_forward: false,
             input_locked: false,
@@ -205,6 +220,11 @@ impl Settings {
         self.theme_mode = pick(&self.theme_mode, &["dark", "light", "system"], "dark");
         self.audio_source = pick(&self.audio_source, &["auto", "process", "off"], "auto");
         self.graphics_api = pick(&self.graphics_api, &["auto", "d3d11", "d3d12"], "auto");
+        self.pause_algorithm = pick(
+            &self.pause_algorithm,
+            &["grid", "foreground", "all", "gamemode"],
+            "grid",
+        );
 
         self.audio_process = self.audio_process.trim().to_lowercase();
         // 显示器索引：`-1` = 全部显示器，`0..` = 具体某一块；其它脏值一律落回主显示器
@@ -331,11 +351,7 @@ fn normalize_params(params: Vec<CustomParam>) -> Vec<CustomParam> {
                 existing.value = value;
                 existing.locked = locked;
             }
-            None => out.push(CustomParam {
-                key,
-                value,
-                locked,
-            }),
+            None => out.push(CustomParam { key, value, locked }),
         }
     }
 
@@ -488,7 +504,10 @@ mod tests {
 
     #[test]
     fn a_utf8_bom_does_not_break_parsing() {
-        let text = format!("\u{feff}{}", serde_json::to_string(&Settings::default()).unwrap());
+        let text = format!(
+            "\u{feff}{}",
+            serde_json::to_string(&Settings::default()).unwrap()
+        );
         let parsed: Settings = serde_json::from_str(strip_bom(&text)).expect("BOM 应当被吃掉");
         assert_eq!(parsed, Settings::default());
         // 没有 BOM 时也不能被误伤
@@ -498,11 +517,17 @@ mod tests {
     #[test]
     fn defaults_ship_beat_locked_and_costume_unlocked() {
         let params = Settings::default().custom_params;
-        let beat = params.iter().find(|p| p.key == PARAM_BEAT).expect("节拍参数应当预置");
+        let beat = params
+            .iter()
+            .find(|p| p.key == PARAM_BEAT)
+            .expect("节拍参数应当预置");
         assert_eq!(beat.value, "1");
         assert!(beat.locked, "节拍参数必须默认锁定");
 
-        let costume = params.iter().find(|p| p.key == PARAM_COSTUME).expect("服装参数应当预置");
+        let costume = params
+            .iter()
+            .find(|p| p.key == PARAM_COSTUME)
+            .expect("服装参数应当预置");
         assert_eq!(costume.value, PARAM_COSTUME_RANDOM);
         assert!(!costume.locked, "服装参数默认不锁定");
     }
@@ -511,9 +536,11 @@ mod tests {
     fn preset_keys_match_regardless_of_case_but_keep_their_spelling() {
         // 手工写的 settings.json 用了别的写法：应当归一成官方拼写，且用户填的值要保留
         let settings = Settings {
-            custom_params: vec![
-                CustomParam { key: "COSTUME".into(), value: "casual".into(), locked: false },
-            ],
+            custom_params: vec![CustomParam {
+                key: "COSTUME".into(),
+                value: "casual".into(),
+                locked: false,
+            }],
             ..Default::default()
         }
         .normalized();
@@ -531,10 +558,9 @@ mod tests {
     #[test]
     fn a_hand_edited_file_cannot_unlock_or_drop_the_beat_param() {
         // 用户手改 settings.json：试图删掉节拍、或把它解锁并关掉 —— 都必须被纠正回来
-        let tampered: Settings = serde_json::from_str(
-            r#"{"customParams":[{"key":"BEAT","value":"0","locked":false}]}"#,
-        )
-        .expect("partial");
+        let tampered: Settings =
+            serde_json::from_str(r#"{"customParams":[{"key":"BEAT","value":"0","locked":false}]}"#)
+                .expect("partial");
         let params = tampered.normalized().custom_params;
 
         let beat = params
@@ -542,9 +568,14 @@ mod tests {
             .find(|p| p.key.eq_ignore_ascii_case(PARAM_BEAT))
             .expect("节拍参数必须被补回");
         assert!(beat.locked, "锁定状态必须被强制恢复");
-        assert_eq!(beat.value, "0", "值本身是用户可调的自由度，只锁「不可关闭」这一点");
+        assert_eq!(
+            beat.value, "0",
+            "值本身是用户可调的自由度，只锁「不可关闭」这一点"
+        );
         assert!(
-            params.iter().any(|p| p.key.eq_ignore_ascii_case(PARAM_COSTUME)),
+            params
+                .iter()
+                .any(|p| p.key.eq_ignore_ascii_case(PARAM_COSTUME)),
             "服装参数应当被补回"
         );
     }
@@ -553,10 +584,26 @@ mod tests {
     fn duplicate_and_dirty_param_keys_collapse() {
         let dirty = Settings {
             custom_params: vec![
-                CustomParam { key: " My Key! ".into(), value: "a".into(), locked: false },
-                CustomParam { key: "mykey".into(), value: "b".into(), locked: true },
-                CustomParam { key: "   ".into(), value: "dropped".into(), locked: false },
-                CustomParam { key: "multiline".into(), value: "x\ny".into(), locked: false },
+                CustomParam {
+                    key: " My Key! ".into(),
+                    value: "a".into(),
+                    locked: false,
+                },
+                CustomParam {
+                    key: "mykey".into(),
+                    value: "b".into(),
+                    locked: true,
+                },
+                CustomParam {
+                    key: "   ".into(),
+                    value: "dropped".into(),
+                    locked: false,
+                },
+                CustomParam {
+                    key: "multiline".into(),
+                    value: "x\ny".into(),
+                    locked: false,
+                },
             ],
             ..Default::default()
         }
@@ -583,7 +630,11 @@ mod tests {
         // 空键丢弃
         assert!(!dirty.custom_params.iter().any(|p| p.value == "dropped"));
         // 换行被压平
-        let multi = dirty.custom_params.iter().find(|p| p.key == "multiline").unwrap();
+        let multi = dirty
+            .custom_params
+            .iter()
+            .find(|p| p.key == "multiline")
+            .unwrap();
         assert_eq!(multi.value, "x y");
     }
 
@@ -591,9 +642,11 @@ mod tests {
     fn preset_keys_snap_to_their_official_spelling() {
         // 手打别的写法也能用，但会被归一成官方拼写，界面才能查到展示名
         let settings = Settings {
-            custom_params: vec![
-                CustomParam { key: "BEAT".into(), value: "1".into(), locked: false },
-            ],
+            custom_params: vec![CustomParam {
+                key: "BEAT".into(),
+                value: "1".into(),
+                locked: false,
+            }],
             ..Default::default()
         }
         .normalized();
@@ -609,10 +662,43 @@ mod tests {
 
     #[test]
     fn a_silly_report_port_falls_back() {
-        let settings = Settings { report_port: 80, ..Default::default() }.normalized();
+        let settings = Settings {
+            report_port: 80,
+            ..Default::default()
+        }
+        .normalized();
         assert_eq!(settings.report_port, DEFAULT_REPORT_PORT);
         // 0 = 显式关闭上报，应当被保留
-        let off = Settings { report_port: 0, ..Default::default() }.normalized();
+        let off = Settings {
+            report_port: 0,
+            ..Default::default()
+        }
+        .normalized();
         assert_eq!(off.report_port, 0);
+    }
+
+    #[test]
+    fn pause_algorithm_snaps_to_a_known_value() {
+        // 认得的算法原样保留
+        for algo in ["grid", "foreground", "all", "gamemode"] {
+            let settings = Settings {
+                pause_algorithm: algo.into(),
+                ..Default::default()
+            }
+            .normalized();
+            assert_eq!(settings.pause_algorithm, algo);
+        }
+        // 脏值 / 空串落回默认 grid
+        for junk in ["", "GAMEMODE", "tile", "  "] {
+            let settings = Settings {
+                pause_algorithm: junk.into(),
+                ..Default::default()
+            }
+            .normalized();
+            assert_eq!(
+                settings.pause_algorithm, "grid",
+                "脏值 {junk:?} 应落回 grid"
+            );
+        }
     }
 }

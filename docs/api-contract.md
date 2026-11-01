@@ -33,9 +33,11 @@ JSON 一律 **camelCase**。字段全部有默认值：文件缺失 / 坏掉 / �
 | `monitorIndex` | number | `0` | 挂到第几台显示器，`-1` = 全部显示器（整个虚拟桌面），`0` = 主显示器 |
 | `extraArgs` | string | `""` | 追加的启动参数（空格分隔）；排在宿主自己拼的参数之后，可以覆盖它们 |
 | `graphicsApi` | string | `"auto"` | `auto` / `d3d11` / `d3d12` → 壁纸进程的 `-force-d3d11` / `-force-d3d12`。**D3D12 下动态分辨率（`ScalableBufferManager`）才生效**，也就是 `renderScale` 只有选 D3D12 才有意义；改这一项会重启壁纸进程 |
-| `pauseOnFullscreen` | bool | `true` | 全屏应用 / 演示模式时暂停壁纸 |
+| `pauseOnFullscreen` | bool | `true` | 有应用遮挡桌面时暂停壁纸（判定见 `pauseAlgorithm`） |
+| `pauseAlgorithm` | string | `"grid"` | 遮挡检测算法：`grid`（多窗口拼合，默认）/ `foreground`（仅前台窗口）/ `all`（任一窗口）/ `gamemode`（仅独占全屏游戏）。对齐 Lively 的 `ProcessMonitorAlgorithm` |
 | `pauseOnBattery` | bool | `false` | 使用电池时暂停壁纸 |
-| `pauseWhenForeground` | bool | `false` | 前台窗口最大化（非桌面）时暂停壁纸 |
+| `pauseOnBatterySaver` | bool | `false` | 系统进入电池节能模式（Battery Saver）时暂停壁纸 |
+| `pauseWhenForeground` | bool | `false` | 前台有任意应用（非桌面）时暂停壁纸，比「遮挡」更激进 |
 | `inputForward` | bool | `false` | 是否把鼠标/键盘转发给壁纸窗口（合成窗口消息，**不抢前台焦点**） |
 | `inputLocked` | bool | `false` | 锁定：完全不转发（防误触） |
 | `customParams` | array | 见下 | 透传给壁纸端的业务参数（宿主不解释语义） |
@@ -260,7 +262,7 @@ Rust 命令名一律 snake_case，**参数名一律 camelCase**（Tauri 会自�
 | `wp://audio-status` | `AudioStatus` | 每 1.2s + 变化时 |
 | `wp://param-report` | `ParamReportSnapshot`（不含 `ageMs`） | 收到壁纸端上报时（约每 1–2s） |
 | `wp://settings` | `Settings` | 保存后 |
-| `wp://monitor` | `{ attached, occluded, fullscreen, onBattery, foreground, paused, pid, mode, monitorIndex }` | 每 2s |
+| `wp://monitor` | `{ attached, occluded, covered, foregroundApp, onBattery, onBatterySaver, paused, pid, mode, monitorIndex }` | 每 2s |
 | `wp://log` | `{ level: "info"\|"warn"\|"error", message: string, at: number }` | 有日志时 |
 
 ---

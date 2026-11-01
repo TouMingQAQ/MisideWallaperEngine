@@ -9,7 +9,8 @@ use std::sync::Mutex;
 
 use serde::Serialize;
 use windows::core::{s, w, Interface, PCWSTR};
-use windows::Win32::Foundation::{HWND, MAX_PATH};
+use windows::Win32::Foundation::{HWND, LPARAM, MAX_PATH, RECT};
+use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
 use windows::Win32::Media::Audio::{
     eConsole, eRender, IAudioSessionControl2, IAudioSessionManager2, IMMDeviceEnumerator,
     ISimpleAudioVolume, MMDeviceEnumerator,
@@ -21,22 +22,21 @@ use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 use windows::Win32::System::Power::{GetSystemPowerStatus, SYSTEM_POWER_STATUS};
 use windows::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
 use windows::Win32::System::Registry::{
-    RegCreateKeyExW, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW,
-    HKEY, HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_OPTION_NON_VOLATILE, REG_SZ,
+    RegCreateKeyExW, RegDeleteValueW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW, HKEY,
+    HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_OPTION_NON_VOLATILE, REG_SZ,
 };
 use windows::Win32::System::Threading::{
     OpenProcess, PROCESS_ACCESS_RIGHTS, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SUSPEND_RESUME,
     PROCESS_TERMINATE,
 };
-use windows::Win32::UI::Shell::{
-    SHQueryUserNotificationState, QUNS_BUSY, QUNS_PRESENTATION_MODE, QUNS_RUNNING_D3D_FULL_SCREEN,
-};
+use windows::Win32::UI::Shell::{SHQueryUserNotificationState, QUNS_RUNNING_D3D_FULL_SCREEN};
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetForegroundWindow, GetWindowLongPtrW, GetWindowThreadProcessId, IsIconic, IsWindowVisible,
-    IsZoomed, GWL_STYLE, WS_MAXIMIZE,
+    EnumWindows, GetForegroundWindow, GetWindowLongPtrW, GetWindowRect, GetWindowTextLengthW,
+    GetWindowThreadProcessId, IsIconic, IsWindowVisible, IsZoomed, GWL_EXSTYLE, WS_EX_TOOLWINDOW,
 };
 
 use super::desktop;
+use crate::prefs::Settings;
 
 /// 开机自启在注册表 `Run` 键下的值名。
 pub const AUTOSTART_VALUE: &str = "miside-wallpaper-engine";
@@ -46,58 +46,205 @@ const AUTOSTART_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SystemState {
-    /// 有全屏应用 / 演示模式在跑（Lively 用的 `SHQueryUserNotificationState`）。
-    pub fullscreen: bool,
-    /// 前台有窗口铺满整块显示器（且不是桌面、不是我们自己）。
-    pub foreground_fullscreen: bool,
+    /// 按当前算法判定：有可见应用盖住了目标显示器（`pause_algorithm` 决定怎么算）。
+    pub covered: bool,
+    /// 前台有普通应用（非桌面、非壁纸、非宿主自己）。
+    pub foreground_app: bool,
     /// 正在用电池。
     pub on_battery: bool,
+    /// 电池已进入节能模式（Battery Saver）。
+    pub on_battery_saver: bool,
     /// 桌面当前是前台（输入转发只在这时候开闸）。
     pub desktop_foreground: bool,
 }
 
-/// 采样一次系统状态。
-pub fn system_state() -> SystemState {
+/// 采样一次系统状态。`settings` 用来决定用哪种覆盖算法。
+pub fn system_state(settings: &Settings) -> SystemState {
     SystemState {
-        fullscreen: is_fullscreen_running(),
-        foreground_fullscreen: is_foreground_fullscreen(),
+        covered: monitor_covered(settings),
+        foreground_app: foreground_is_app(),
         on_battery: is_on_battery(),
+        on_battery_saver: is_battery_saver_on(),
         desktop_foreground: desktop::is_desktop_foreground(),
     }
 }
 
-/// 全屏应用 / 演示模式检测。
+/// 判定「是否有应用盖住了目标显示器」——按设置里的算法分派。
 ///
-/// **不能只看 `SHQueryUserNotificationState` 的 `QUNS_BUSY`**：外壳在切换前台窗口
-/// （点别的程序、Alt+Tab、开开始菜单）时会短暂地报 BUSY，用户看到的现象就是
-/// "一切换到别的程序，壁纸就停一下又自己回来"。所以：
-/// * `QUNS_RUNNING_D3D_FULL_SCREEN`（独占全屏的游戏）/ `QUNS_PRESENTATION_MODE` → 直接算；
-/// * `QUNS_BUSY` → 再要一条实证：前台**真的**有一个盖满整块显示器的窗口（且不是桌面层/壁纸自己）。
-pub fn is_fullscreen_running() -> bool {
-    unsafe {
-        match SHQueryUserNotificationState() {
-            Ok(state) => {
-                if state == QUNS_RUNNING_D3D_FULL_SCREEN || state == QUNS_PRESENTATION_MODE {
-                    return true;
-                }
-                if state == QUNS_BUSY {
-                    return foreground_covers_monitor();
-                }
-                foreground_covers_monitor() && !foreground_is_maximized()
-            }
-            Err(_) => false,
+/// 对齐 Lively 的 `ProcessMonitorAlgorithm`：
+/// * `gamemode` —— 只用系统 `SHQueryUserNotificationState == QUNS_RUNNING_D3D_FULL_SCREEN`（独占全屏游戏）；
+/// * `foreground` —— 只看前台窗口，它最大化或盖满 ≥95% 目标屏才算；
+/// * `all` —— 任一可见窗口最大化或盖满 ≥95% 目标屏就算；
+/// * `grid`（默认）—— 多个窗口**拼起来**盖满 ≥95% 才算（把两个半屏窗口也认定为遮挡）。
+///   单窗口、或任意窗口最大化时同样直接算覆盖。
+pub fn monitor_covered(settings: &Settings) -> bool {
+    if settings.pause_algorithm == "gamemode" {
+        return gamemode_fullscreen();
+    }
+    let target = desktop::target_rect(settings.monitor_index);
+    let windows = visible_app_windows();
+    match settings.pause_algorithm.as_str() {
+        "foreground" => {
+            // 只看前台：前台必须是普通应用，且它自己盖住了目标屏
+            let foreground = unsafe { GetForegroundWindow() };
+            windows.iter().any(|w| *w == foreground) && window_covers_target(foreground, target)
         }
+        "all" => windows.iter().any(|w| window_covers_target(*w, target)),
+        // grid 与任何未知值都走网格拼接
+        _ => windows_covered_by_grid(&windows, target),
     }
 }
 
-/// 前台窗口是不是铺满了它所在的显示器。
-///
-/// 桌面层（Progman / WorkerW / 桌面图标）、挂在桌面层里的壁纸窗口、以及宿主自己的窗口都不算 ——
-/// 用户在桌面上点来点去、或焦点短暂落到壁纸层，都不该把壁纸暂停掉。
-pub fn foreground_covers_monitor() -> bool {
+/// 覆盖阈值：窗口（或其拼合）盖住目标显示器的这个比例，就算「挡住了」。
+const COVER_THRESHOLD: f32 = 0.95;
+/// 网格边长（像素），与 Lively 默认一致。
+const GRID_TILE: i32 = 50;
+
+/// 枚举所有「可见的普通应用窗口」——排除桌面层、壁纸自己、宿主自己、工具窗、被 DWM cloak 的窗口。
+fn visible_app_windows() -> Vec<HWND> {
+    unsafe extern "system" fn callback(window: HWND, data: LPARAM) -> windows::core::BOOL {
+        let out = &mut *(data.0 as *mut Vec<HWND>);
+        if window_is_app_candidate(window) {
+            out.push(window);
+        }
+        windows::core::BOOL(1)
+    }
+
+    let mut out: Vec<HWND> = Vec::new();
+    unsafe {
+        let _ = EnumWindows(Some(callback), LPARAM(&mut out as *mut Vec<HWND> as isize));
+    }
+    out
+}
+
+/// 这个窗口是不是值得参与「遮挡判定」的普通应用窗口。
+fn window_is_app_candidate(window: HWND) -> bool {
+    unsafe {
+        if window.is_invalid() {
+            return false;
+        }
+        if !IsWindowVisible(window).as_bool() || IsIconic(window).as_bool() {
+            return false;
+        }
+        // 无标题的窗口多是隐藏/辅助窗口，不算
+        if GetWindowTextLengthW(window) == 0 {
+            return false;
+        }
+        let ex_style = GetWindowLongPtrW(window, GWL_EXSTYLE) as u32;
+        if ex_style & WS_EX_TOOLWINDOW.0 != 0 {
+            return false;
+        }
+        // 被 DWM cloak 的窗口（虚拟桌面切走、被系统隐藏）实际不可见
+        let mut cloaked: u32 = 0;
+        if DwmGetWindowAttribute(
+            window,
+            DWMWA_CLOAKED,
+            &mut cloaked as *mut _ as *mut c_void,
+            std::mem::size_of::<u32>() as u32,
+        )
+        .is_ok()
+            && cloaked != 0
+        {
+            return false;
+        }
+        // 桌面层 / 壁纸自己 / 宿主自己都不算
+        if desktop::is_desktop_window(window) || desktop::is_wallpaper_window(window) {
+            return false;
+        }
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(window, Some(&mut pid));
+        pid != 0 && pid != std::process::id()
+    }
+}
+
+/// 单个窗口是否「盖住了目标显示器」：最大化且覆盖目标主要区域，或与目标的重叠 ≥95%。
+fn window_covers_target(window: HWND, target: RECT) -> bool {
+    let mut rect = RECT::default();
+    if unsafe { GetWindowRect(window, &mut rect) }.is_err() {
+        return false;
+    }
+    if unsafe { IsZoomed(window) }.as_bool() {
+        // 最大化窗口基本铺满它所在显示器；只要它确实落在目标屏上就算
+        return intersects_ratio(rect, target) >= 0.5;
+    }
+    intersects_ratio(rect, target) >= COVER_THRESHOLD
+}
+
+/// 多个窗口「拼起来」盖住目标显示器的比例是否达到阈值（网格并集法）。
+fn windows_covered_by_grid(windows: &[HWND], target: RECT) -> bool {
+    let width = target.right - target.left;
+    let height = target.bottom - target.top;
+    if width <= 0 || height <= 0 {
+        return false;
+    }
+    let cols = ((width + GRID_TILE - 1) / GRID_TILE).max(1);
+    let rows = ((height + GRID_TILE - 1) / GRID_TILE).max(1);
+    let total = cols * rows;
+    let mut covered = vec![false; total as usize];
+    let mut covered_count: i32 = 0;
+
+    for &window in windows {
+        let mut rect = RECT::default();
+        if unsafe { GetWindowRect(window, &mut rect) }.is_err() {
+            continue;
+        }
+        // 单窗口就盖满、或最大化窗口落在目标屏上：直接算覆盖
+        if intersects_ratio(rect, target) >= COVER_THRESHOLD {
+            return true;
+        }
+        if unsafe { IsZoomed(window) }.as_bool() && intersects_ratio(rect, target) >= 0.5 {
+            return true;
+        }
+        // 把窗口覆盖到的格子打上标记
+        let x0 = ((rect.left - target.left) / GRID_TILE).max(0);
+        let x1 = ((rect.right - target.left - 1) / GRID_TILE).min(cols - 1);
+        let y0 = ((rect.top - target.top) / GRID_TILE).max(0);
+        let y1 = ((rect.bottom - target.top - 1) / GRID_TILE).min(rows - 1);
+        if x1 < x0 || y1 < y0 {
+            continue;
+        }
+        for y in y0..=y1 {
+            for x in x0..=x1 {
+                let index = (y * cols + x) as usize;
+                if !covered[index] {
+                    covered[index] = true;
+                    covered_count += 1;
+                    if (total - covered_count) as f32 / total as f32 <= 1.0 - COVER_THRESHOLD {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+/// 窗口矩形与目标矩形重叠面积占目标面积的比例（0..=1）。
+fn intersects_ratio(window: RECT, target: RECT) -> f32 {
+    let overlap_w = (window.right.min(target.right) - window.left.max(target.left)).max(0) as f32;
+    let overlap_h = (window.bottom.min(target.bottom) - window.top.max(target.top)).max(0) as f32;
+    let target_area = (target.right - target.left) as f32 * (target.bottom - target.top) as f32;
+    if target_area <= 0.0 {
+        return 0.0;
+    }
+    (overlap_w * overlap_h) / target_area
+}
+
+/// 独占全屏游戏（`gamemode` 算法）：只信任系统的 D3D 全屏通知状态。
+fn gamemode_fullscreen() -> bool {
+    unsafe {
+        matches!(
+            SHQueryUserNotificationState(),
+            Ok(QUNS_RUNNING_D3D_FULL_SCREEN)
+        )
+    }
+}
+
+/// 前台是不是一个普通应用（非桌面、非壁纸、非宿主）。
+fn foreground_is_app() -> bool {
     unsafe {
         let foreground = GetForegroundWindow();
-        if foreground.is_invalid() || !IsWindowVisible(foreground).as_bool() || IsIconic(foreground).as_bool() {
+        if foreground.is_invalid() {
             return false;
         }
         if desktop::is_desktop_foreground() || desktop::is_wallpaper_window(foreground) {
@@ -105,40 +252,8 @@ pub fn foreground_covers_monitor() -> bool {
         }
         let mut pid = 0u32;
         GetWindowThreadProcessId(foreground, Some(&mut pid));
-        if pid == std::process::id() { return false; }
-        let Some(monitor) = desktop::monitor_of_window(foreground) else { return false; };
-        let mut rect = windows::Win32::Foundation::RECT::default();
-        if windows::Win32::UI::WindowsAndMessaging::GetWindowRect(foreground, &mut rect).is_err() { return false; }
-        rect.right - rect.left >= monitor.width - 2 && rect.bottom - rect.top >= monitor.height - 2
+        pid != 0 && pid != std::process::id()
     }
-}
-
-/// 前台窗口是否最大化。不能只依赖 IsZoomed：部分 WebView/无边框窗口
-/// 会保留 WS_MAXIMIZE 样式但 IsZoomed 返回 false。
-fn foreground_is_maximized() -> bool {
-    unsafe {
-        let foreground = GetForegroundWindow();
-        if foreground.is_invalid()
-            || !IsWindowVisible(foreground).as_bool()
-            || IsIconic(foreground).as_bool()
-            || desktop::is_desktop_foreground()
-            || desktop::is_wallpaper_window(foreground)
-        {
-            return false;
-        }
-        let mut pid = 0u32;
-        GetWindowThreadProcessId(foreground, Some(&mut pid));
-        if pid == 0 || pid == std::process::id() {
-            return false;
-        }
-        let style = GetWindowLongPtrW(foreground, GWL_STYLE) as u32;
-        IsZoomed(foreground).as_bool() || (style & WS_MAXIMIZE.0) != 0
-    }
-}
-
-/// 前台窗口是否最大化（该设置不要求窗口正好铺满整个显示器）。
-pub fn is_foreground_fullscreen() -> bool {
-    foreground_is_maximized()
 }
 
 /// 是否正在用电池（台式机 / 查不到时为 false）。
@@ -150,6 +265,18 @@ pub fn is_on_battery() -> bool {
         }
         // ACLineStatus: 0 = 电池供电，1 = 接市电，255 = 未知
         status.ACLineStatus == 0
+    }
+}
+
+/// 电池是否进入节能模式（Battery Saver）。
+pub fn is_battery_saver_on() -> bool {
+    unsafe {
+        let mut status = SYSTEM_POWER_STATUS::default();
+        if GetSystemPowerStatus(&mut status).is_err() {
+            return false;
+        }
+        // SystemStatusFlag: 1 = 节能模式开启（Windows 10+）
+        status.SystemStatusFlag == 1
     }
 }
 
@@ -242,7 +369,11 @@ pub fn resume_process(pid: u32) -> Result<(), String> {
 ///
 /// 返回 `Ok(false)` 表示进程当前没有音频会话（还没出声），调用方可以稍后重试 ——
 /// 这不是错误，Unity 壁纸在播放第一段音频之前确实没有会话。
-pub fn set_process_volume(pid: u32, volume: Option<f32>, muted: Option<bool>) -> Result<bool, String> {
+pub fn set_process_volume(
+    pid: u32,
+    volume: Option<f32>,
+    muted: Option<bool>,
+) -> Result<bool, String> {
     if pid == 0 {
         return Ok(false);
     }
@@ -262,7 +393,9 @@ pub fn set_process_volume(pid: u32, volume: Option<f32>, muted: Option<bool>) ->
         let sessions = manager
             .GetSessionEnumerator()
             .map_err(|e| format!("枚举音频会话失败：{e}"))?;
-        let count = sessions.GetCount().map_err(|e| format!("读取会话数失败：{e}"))?;
+        let count = sessions
+            .GetCount()
+            .map_err(|e| format!("读取会话数失败：{e}"))?;
 
         let mut touched = false;
         for index in 0..count {
@@ -298,12 +431,8 @@ pub fn set_process_volume(pid: u32, volume: Option<f32>, muted: Option<bool>) ->
 
 fn exe_path() -> Option<String> {
     let mut buffer = vec![0u16; MAX_PATH as usize];
-    let length = unsafe {
-        windows::Win32::System::LibraryLoader::GetModuleFileNameW(
-            None,
-            &mut buffer,
-        )
-    };
+    let length =
+        unsafe { windows::Win32::System::LibraryLoader::GetModuleFileNameW(None, &mut buffer) };
     if length == 0 {
         return None;
     }
@@ -440,14 +569,15 @@ pub fn process_alive(pid: u32) -> bool {
         return false;
     }
     unsafe {
-        match OpenProcess(PROCESS_ACCESS_RIGHTS(PROCESS_QUERY_LIMITED_INFORMATION.0), false, pid) {
+        match OpenProcess(
+            PROCESS_ACCESS_RIGHTS(PROCESS_QUERY_LIMITED_INFORMATION.0),
+            false,
+            pid,
+        ) {
             Ok(handle) => {
                 let mut code = 0u32;
-                let ok = windows::Win32::System::Threading::GetExitCodeProcess(
-                    handle,
-                    &mut code,
-                )
-                .is_ok();
+                let ok = windows::Win32::System::Threading::GetExitCodeProcess(handle, &mut code)
+                    .is_ok();
                 let _ = windows::Win32::Foundation::CloseHandle(handle);
                 ok && code == 259 // STILL_ACTIVE
             }
@@ -554,7 +684,9 @@ impl KillOnCloseJob {
     /// 失败不算致命：老系统上可能不允许嵌套 Job，那就退回"退出时主动杀 + 启动时清理孤儿"。
     pub fn assign(&self, pid: u32) -> Result<(), String> {
         use windows::Win32::System::JobObjects::AssignProcessToJobObject;
-        use windows::Win32::System::Threading::{OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE};
+        use windows::Win32::System::Threading::{
+            OpenProcess, PROCESS_SET_QUOTA, PROCESS_TERMINATE,
+        };
         unsafe {
             let process = OpenProcess(PROCESS_SET_QUOTA | PROCESS_TERMINATE, false, pid)
                 .map_err(|e| format!("打开进程 {pid} 失败：{e}"))?;

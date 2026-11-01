@@ -52,7 +52,10 @@ export interface Settings {
   graphicsApi: "auto" | "d3d11" | "d3d12";
   pauseOnFullscreen: boolean;
   pauseOnBattery: boolean;
+  pauseOnBatterySaver: boolean;
   pauseWhenForeground: boolean;
+  /** 遮挡/全屏检测算法：grid（默认，多窗口拼合）/ foreground（只看前台）/ all（任一窗口）/ gamemode（独占全屏） */
+  pauseAlgorithm: "grid" | "foreground" | "all" | "gamemode";
   inputForward: boolean;
   inputLocked: boolean;
   /** 透传给壁纸端的业务参数（宿主不解释语义） */
@@ -215,9 +218,12 @@ export interface ImportProgress {
 export interface MonitorState {
   attached: boolean;
   occluded: boolean;
-  fullscreen: boolean;
+  /** 按当前算法判定：有应用盖住了桌面 */
+  covered: boolean;
+  /** 前台有普通应用（非桌面/壁纸） */
+  foregroundApp: boolean;
   onBattery: boolean;
-  foreground: boolean;
+  onBatterySaver: boolean;
   paused: boolean;
   pid: number;
   mode: WallpaperMode;
@@ -273,7 +279,9 @@ export const DEFAULT_SETTINGS: Settings = {
   graphicsApi: "auto",
   pauseOnFullscreen: true,
   pauseOnBattery: false,
+  pauseOnBatterySaver: false,
   pauseWhenForeground: false,
+  pauseAlgorithm: "grid",
   inputForward: false,
   inputLocked: false,
   // 预置参数：节拍（锁定）+ 服装。与 Rust 侧 `Settings::default()` 保持一致。
@@ -460,6 +468,9 @@ export const api = {
   setAutostart: (enabled: boolean) => call<boolean>("set_autostart", { enabled }),
 
   openLogDir: () => call<void>("open_log_dir"),
+
+  /** 导出诊断日志（打包系统/DPI/几何/日志等），返回保存路径；取消则 rejected */
+  exportDiagnostics: () => call<string>("export_diagnostics"),
 };
 
 /* ======================================================================== *

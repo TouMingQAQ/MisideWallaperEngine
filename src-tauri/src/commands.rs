@@ -40,6 +40,9 @@ const MAX_LOGS: usize = 500;
 /// 日志文件上限（超过就轮转一次）。
 const MAX_LOG_BYTES: u64 = 2 * 1024 * 1024;
 
+/// 上一次记录的壁纸窗口几何摘要；变化时才写日志，避免每 250ms 刷屏。
+static LAST_GEOMETRY: Mutex<String> = Mutex::new(String::new());
+
 /* ------------------------------------------------------------------ 状态 */
 
 /// 一条日志。
@@ -59,9 +62,10 @@ pub struct LogLine {
 pub struct MonitorTick {
     pub attached: bool,
     pub occluded: bool,
-    pub fullscreen: bool,
+    pub covered: bool,
+    pub foreground_app: bool,
     pub on_battery: bool,
-    pub foreground: bool,
+    pub on_battery_saver: bool,
     pub paused: bool,
     pub pid: u32,
     pub mode: String,
@@ -131,7 +135,9 @@ impl AppState {
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /* ------------------------------------------------------------------ 日志 */
@@ -380,8 +386,14 @@ fn start_active(
             "开始采集 {}（PID {}）· {} Hz / {} 声道",
             target.process_name,
             active.pid,
-            active.counters.sample_rate.load(std::sync::atomic::Ordering::Relaxed),
-            active.counters.channels.load(std::sync::atomic::Ordering::Relaxed),
+            active
+                .counters
+                .sample_rate
+                .load(std::sync::atomic::Ordering::Relaxed),
+            active
+                .counters
+                .channels
+                .load(std::sync::atomic::Ordering::Relaxed),
         ),
     );
     *lock(&state.capture) = Some(active);
@@ -520,7 +532,11 @@ fn sync_audio(app: &AppHandle, state: &AppState, settings: &Settings) {
                     match start_active(app, state, &target, settings) {
                         Ok(()) => lock(&state.source).failed = None,
                         Err(err) => {
-                            log(app, "error", format!("采集 {} 失败：{err}", target.process_name));
+                            log(
+                                app,
+                                "error",
+                                format!("采集 {} 失败：{err}", target.process_name),
+                            );
                             lock(&state.source).failed =
                                 Some((target.process_name.clone(), Instant::now()));
                         }
@@ -575,12 +591,14 @@ fn spawn_monitor(app: AppHandle) {
 fn scan_once(app: &AppHandle) {
     let state = app.state::<AppState>();
     let settings = state.settings();
-    let system = control::system_state();
+    let system = control::system_state(&settings);
 
     // 1. 壁纸进程
-    let (snapshot, auto_pause_note) = {
+    let (snapshot, auto_pause_note, attached_changed) = {
         let mut host = lock(&state.host);
-        let was_auto_paused = host.state().auto_paused;
+        let previous = host.state();
+        let was_auto_paused = previous.auto_paused;
+        let was_attached = previous.attached;
         host.tick(&settings, &system);
         let snapshot = host.state();
         // 自动暂停过去只改状态不写日志，"壁纸为什么自己停了"就只能靠猜 —— 补上原因
@@ -593,10 +611,39 @@ fn scan_once(app: &AppHandle) {
         } else {
             None
         };
-        (snapshot, note)
+        let attached_changed = snapshot.attached != was_attached;
+        (snapshot, note, attached_changed)
     };
     if let Some(note) = auto_pause_note {
         log(app, "info", note);
+    }
+    if attached_changed {
+        log(
+            app,
+            "info",
+            if snapshot.attached {
+                "壁纸已挂到桌面层"
+            } else {
+                "壁纸离开桌面层（可能是显示桌面 / explorer 重启，等待重挂）"
+            },
+        );
+    }
+
+    // 诊断：壁纸窗口几何一旦变化就记一条（减少刷屏，只在真的变了时写）。
+    // 排查"壁纸缩小到左上角 / 错位"时，这条日志能直接看到尺寸/位置/所属显示器是怎么变的。
+    if snapshot.mode == "desktop" && snapshot.hwnd != 0 {
+        let summary = desktop::window_geometry_summary(snapshot.hwnd as isize);
+        let mut last = lock(&LAST_GEOMETRY);
+        if *last != summary {
+            if !last.is_empty() {
+                log(app, "info", format!("壁纸窗口几何变化：{summary}"));
+            } else {
+                log(app, "info", format!("壁纸窗口几何：{summary}"));
+            }
+            *last = summary;
+        }
+    } else {
+        *lock(&LAST_GEOMETRY) = String::new();
     }
     audio_link::set_paused(snapshot.paused);
     audio_link::set_input_publishing(snapshot.input_forwarding && system.desktop_foreground);
@@ -607,9 +654,10 @@ fn scan_once(app: &AppHandle) {
         MonitorTick {
             attached: snapshot.attached,
             occluded: snapshot.occluded,
-            fullscreen: system.fullscreen,
+            covered: system.covered,
+            foreground_app: system.foreground_app,
             on_battery: system.on_battery,
-            foreground: system.foreground_fullscreen,
+            on_battery_saver: system.on_battery_saver,
             paused: snapshot.paused,
             pid: snapshot.pid,
             mode: snapshot.mode.clone(),
@@ -637,7 +685,11 @@ fn get_settings(state: State<'_, AppState>) -> Settings {
 /// * 渲染倍率 / 显示器变了 —— 运行中的壁纸要重启才能生效；
 /// * 开机自启变了 —— 同步注册表。
 #[tauri::command]
-fn save_settings(app: AppHandle, state: State<'_, AppState>, settings: Settings) -> Result<Settings, String> {
+fn save_settings(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    settings: Settings,
+) -> Result<Settings, String> {
     let previous = state.settings();
     let next = settings.normalized();
     prefs::store(&app, &next)?;
@@ -1143,7 +1195,11 @@ fn param_report() -> ParamReportSnapshot {
 
 /// 指定音频源（空串 = 回到自动跟随最响的进程）。
 #[tauri::command]
-fn set_audio_target(app: AppHandle, state: State<'_, AppState>, process_name: String) -> AudioStatus {
+fn set_audio_target(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    process_name: String,
+) -> AudioStatus {
     let mut settings = state.settings();
     let trimmed = process_name.trim().to_lowercase();
     if trimmed.is_empty() {
@@ -1194,7 +1250,11 @@ fn set_audio_enabled(app: AppHandle, state: State<'_, AppState>, enabled: bool) 
 /* --------------------------------------------------------------- 系统 */
 
 #[tauri::command]
-fn set_autostart(app: AppHandle, state: State<'_, AppState>, enabled: bool) -> Result<bool, String> {
+fn set_autostart(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    enabled: bool,
+) -> Result<bool, String> {
     let value = control::set_autostart(enabled)?;
     let mut settings = state.settings();
     settings.auto_start = value;
@@ -1223,8 +1283,105 @@ fn open_log_dir(app: AppHandle) -> Result<(), String> {
         .map_err(|e| format!("打开日志目录失败：{e}"))
 }
 
-/* ------------------------------------------------------------------ 入口 */
+/// 导出诊断日志：把系统环境、显示器/DPI、窗口几何、设置、运行状态、内存日志与磁盘日志
+/// 打包成一个 zip，让用户选位置保存后发回分析。
+#[tauri::command(async)]
+fn export_diagnostics(app: AppHandle, state: State<'_, AppState>) -> Result<String, String> {
+    let settings = state.settings();
+    let runtime = state.runtime();
 
+    let mut text = String::new();
+    text.push_str("=== miside-wallpaper-engine 诊断报告 ===\n");
+    text.push_str(&format!(
+        "导出时间: {}\n",
+        library::iso8601(std::time::SystemTime::now())
+    ));
+    text.push_str(&format!("应用版本: {}\n\n", app.package_info().version));
+    text.push_str(&desktop::system_diagnostics());
+
+    text.push_str("\n--- 壁纸窗口几何 ---\n");
+    if runtime.hwnd != 0 {
+        text.push_str(&desktop::window_geometry_summary(runtime.hwnd as isize));
+    } else {
+        text.push_str("（当前没有壁纸窗口）");
+    }
+    text.push('\n');
+
+    text.push_str("\n--- 运行状态 ---\n");
+    text.push_str(&serde_json::to_string_pretty(&runtime).unwrap_or_default());
+
+    text.push_str("\n\n--- 设置 ---\n");
+    text.push_str(&serde_json::to_string_pretty(&settings).unwrap_or_default());
+
+    text.push_str("\n\n--- 内存日志（最近） ---\n");
+    {
+        let logs = lock(&state.logs);
+        for line in logs.iter() {
+            let at = std::time::UNIX_EPOCH + Duration::from_millis(line.at);
+            text.push_str(&format!(
+                "[{}] {:<5} {}\n",
+                library::iso8601(at),
+                line.level.to_uppercase(),
+                line.message
+            ));
+        }
+    }
+
+    // 默认文件名：带时间戳，方便区分多次导出
+    let stamp: String = library::iso8601(std::time::SystemTime::now())
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    let default_name = format!("miside-wallpaper-diagnostics-{stamp}.zip");
+
+    let Some(save_path) = app
+        .dialog()
+        .file()
+        .set_title("导出诊断日志")
+        .set_file_name(&default_name)
+        .add_filter("Zip 压缩包", &["zip"])
+        .blocking_save_file()
+    else {
+        return Err("已取消".to_string());
+    };
+    let path = save_path
+        .into_path()
+        .map_err(|e| format!("解析保存路径失败：{e}"))?;
+
+    // 写 zip：诊断文本 + 现有日志文件
+    {
+        use std::io::Write;
+        let file = std::fs::File::create(&path).map_err(|e| format!("创建文件失败：{e}"))?;
+        let mut writer = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default();
+        writer
+            .start_file("diagnostics.txt", options)
+            .map_err(|e| format!("写入诊断文本失败：{e}"))?;
+        writer
+            .write_all(text.as_bytes())
+            .map_err(|e| format!("写入诊断文本失败：{e}"))?;
+
+        if let Ok(dir) = app.path().app_log_dir() {
+            for name in ["host.log", "host.log.1"] {
+                if let Ok(bytes) = std::fs::read(dir.join(name)) {
+                    writer
+                        .start_file(name, options)
+                        .map_err(|e| format!("写入 {name} 失败：{e}"))?;
+                    writer
+                        .write_all(&bytes)
+                        .map_err(|e| format!("写入 {name} 失败：{e}"))?;
+                }
+            }
+        }
+        writer.finish().map_err(|e| format!("完成压缩失败：{e}"))?;
+    }
+
+    let shown = path.display().to_string();
+    log(&app, "info", format!("已导出诊断日志：{shown}"));
+    Ok(shown)
+}
+
+/* ------------------------------------------------------------------ 入口 */
 /// 构建并运行应用。
 pub fn run_app() {
     let app = tauri::Builder::default()
@@ -1265,6 +1422,7 @@ pub fn run_app() {
             set_audio_enabled,
             set_autostart,
             open_log_dir,
+            export_diagnostics,
         ])
         .setup(|app| {
             let handle = app.handle().clone();

@@ -160,18 +160,40 @@ export function createGeneralTab(): Tab {
   const pauseBattery = toggle(getSettings().pauseOnBattery, (checked) =>
     patchSettings({ pauseOnBattery: checked }),
   );
+  const pauseBatterySaver = toggle(getSettings().pauseOnBatterySaver, (checked) =>
+    patchSettings({ pauseOnBatterySaver: checked }),
+  );
   const pauseForeground = toggle(getSettings().pauseWhenForeground, (checked) =>
     patchSettings({ pauseWhenForeground: checked }),
   );
+
+  // 遮挡检测算法（对齐 Lively 的 ProcessMonitorAlgorithm）
+  const pauseAlgoSelect = h("select", { cls: "select", attrs: { style: "min-width:220px" } });
+  for (const value of ["grid", "foreground", "all", "gamemode"] as const) {
+    const opt = h("option", { text: t(`settings.pauseAlgorithm.${value}`) });
+    opt.value = value;
+    pauseAlgoSelect.append(opt);
+  }
+  pauseAlgoSelect.value = getSettings().pauseAlgorithm;
+  pauseAlgoSelect.addEventListener("change", () => {
+    const value = pauseAlgoSelect.value as Settings["pauseAlgorithm"];
+    patchSettings({ pauseAlgorithm: value });
+  });
+
   const pauseBody = h(
     "div",
     {},
     settingRow(t("settings.pauseOnFullscreen"), t("settings.pauseOnFullscreenHint"), [
       pauseFullscreen,
     ]).row,
-    settingRow(t("settings.pauseOnBattery"), t("settings.pauseOnBatteryHint"), [pauseBattery]).row,
+    settingRow(t("settings.pauseAlgorithm"), t("settings.pauseAlgorithmHint"), [pauseAlgoSelect])
+      .row,
     settingRow(t("settings.pauseWhenForeground"), t("settings.pauseWhenForegroundHint"), [
       pauseForeground,
+    ]).row,
+    settingRow(t("settings.pauseOnBattery"), t("settings.pauseOnBatteryHint"), [pauseBattery]).row,
+    settingRow(t("settings.pauseOnBatterySaver"), t("settings.pauseOnBatterySaverHint"), [
+      pauseBatterySaver,
     ]).row,
   );
   const pauseCard = card(t("settings.groupPause"), "", pauseBody);
@@ -376,7 +398,9 @@ export function createGeneralTab(): Tab {
     setToggle(mutedToggle, s.muted);
     setToggle(pauseFullscreen, s.pauseOnFullscreen);
     setToggle(pauseBattery, s.pauseOnBattery);
+    setToggle(pauseBatterySaver, s.pauseOnBatterySaver);
     setToggle(pauseForeground, s.pauseWhenForeground);
+    if (document.activeElement !== pauseAlgoSelect) pauseAlgoSelect.value = s.pauseAlgorithm;
     setToggle(inputForwardToggle, s.inputForward);
     setToggle(inputLockedToggle, s.inputLocked);
     setToggle(autostartToggle, s.autoStart);

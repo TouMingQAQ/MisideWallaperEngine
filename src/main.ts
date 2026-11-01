@@ -76,7 +76,7 @@ function createTopBar(onOpenSettings: () => void): {
     h("div", { cls: "topbar__actions" }, volumeBox, settingsBtn),
   );
 
-  let version = "0.0.2";
+  let version = "0.0.5";
 
   function renderStatic(): void {
     brandName.textContent = t("app.title");

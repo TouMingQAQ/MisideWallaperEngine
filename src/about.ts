@@ -60,13 +60,28 @@ export function createAboutTab(): Tab {
     })();
   });
 
+  const exportLogBtn = h("button", {
+    cls: "btn btn--sm",
+    html: `${icon("download", 14)}<span>${t("about.exportLog")}</span>`,
+  });
+  exportLogBtn.addEventListener("click", () => {
+    void (async () => {
+      exportLogBtn.disabled = true;
+      try {
+        await store.exportDiagnostics();
+      } finally {
+        exportLogBtn.disabled = false;
+      }
+    })();
+  });
+
   const logBox = h("div", { cls: "logbox" });
   const logEmpty = h("div", { cls: "muted", text: t("about.logEmpty") });
 
   const logCard = card(
     t("about.log"),
     "",
-    h("div", {}, h("div", { cls: "row", attrs: { style: "margin-bottom:8px" } }, logCount, h("div", { cls: "toolbar__spacer" }), openLogDirBtn, clearLogBtn), logBox, logEmpty),
+    h("div", {}, h("div", { cls: "row", attrs: { style: "margin-bottom:8px" } }, logCount, h("div", { cls: "toolbar__spacer" }), exportLogBtn, openLogDirBtn, clearLogBtn), logBox, logEmpty),
   );
 
   const note = h("div", { cls: "about-note", text: t("about.note") });
@@ -218,6 +233,7 @@ export function createAboutTab(): Tab {
     runtimeCard.setText(t("about.runtime"), "");
     logCard.setText(t("about.log"), "");
     openLogDirBtn.innerHTML = `${icon("folderOpen", 14)}<span>${t("about.openLogDir")}</span>`;
+    exportLogBtn.innerHTML = `${icon("download", 14)}<span>${t("about.exportLog")}</span>`;
     clearLogBtn.innerHTML = `${icon("trash", 14)}<span>${t("about.clearLog")}</span>`;
     note.textContent = t("about.note");
     logEmpty.textContent = t("about.logEmpty");

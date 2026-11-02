@@ -151,6 +151,10 @@ fn window_is_app_candidate(window: HWND) -> bool {
         if desktop::is_desktop_window(window) || desktop::is_wallpaper_window(window) {
             return false;
         }
+        // 任务栏 / 开始菜单 / 任务视图等外壳窗口也不算「盖住屏幕的应用」
+        if desktop::is_shell_window(window) {
+            return false;
+        }
         let mut pid = 0u32;
         GetWindowThreadProcessId(window, Some(&mut pid));
         pid != 0 && pid != std::process::id()
@@ -240,7 +244,7 @@ fn gamemode_fullscreen() -> bool {
     }
 }
 
-/// 前台是不是一个普通应用（非桌面、非壁纸、非宿主）。
+/// 前台是不是一个普通应用（非桌面、非壁纸、非宿主、非任务栏/开始菜单等外壳 UI）。
 fn foreground_is_app() -> bool {
     unsafe {
         let foreground = GetForegroundWindow();
@@ -248,6 +252,11 @@ fn foreground_is_app() -> bool {
             return false;
         }
         if desktop::is_desktop_foreground() || desktop::is_wallpaper_window(foreground) {
+            return false;
+        }
+        // 关键：任务栏 / 开始菜单 / 任务视图 / 桌面图标等外壳窗口出现在前台，
+        // 不代表「有应用在运行」。否则点桌面/任务栏就会误触发 pauseWhenForeground。
+        if desktop::is_shell_window(foreground) {
             return false;
         }
         let mut pid = 0u32;

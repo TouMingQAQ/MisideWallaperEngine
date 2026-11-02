@@ -43,6 +43,9 @@ const MAX_LOG_BYTES: u64 = 2 * 1024 * 1024;
 /// 上一次记录的壁纸窗口几何摘要；变化时才写日志，避免每 250ms 刷屏。
 static LAST_GEOMETRY: Mutex<String> = Mutex::new(String::new());
 
+/// 上一次「前台是否为应用」的判定；翻转时才打日志（诊断点桌面被误判的问题）。
+static LAST_FOREGROUND_APP: Mutex<Option<bool>> = Mutex::new(None);
+
 /* ------------------------------------------------------------------ 状态 */
 
 /// 一条日志。
@@ -592,6 +595,25 @@ fn scan_once(app: &AppHandle) {
     let state = app.state::<AppState>();
     let settings = state.settings();
     let system = control::system_state(&settings);
+
+    // 诊断：前台是否被判定为「应用」发生变化时，记一条前台窗口详情。
+    // 专门用来排查「Win11 点桌面却被当成前台有应用 → 触发自动暂停」。
+    {
+        let mut last = lock(&LAST_FOREGROUND_APP);
+        if *last != Some(system.foreground_app) {
+            *last = Some(system.foreground_app);
+            log(
+                app,
+                "info",
+                format!(
+                    "前台判定变化：前台应用={} 桌面前台={} ｜ {}",
+                    system.foreground_app,
+                    system.desktop_foreground,
+                    desktop::foreground_window_summary(),
+                ),
+            );
+        }
+    }
 
     // 1. 壁纸进程
     let (snapshot, auto_pause_note, attached_changed) = {

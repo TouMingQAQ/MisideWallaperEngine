@@ -33,7 +33,8 @@ use windows::Win32::UI::HiDpi::{
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, FindWindowExW, FindWindowW, GetAncestor, GetClassNameW, GetClientRect,
     GetForegroundWindow, GetGUIThreadInfo, GetParent, GetShellWindow, GetSystemMetrics,
-    GetWindowLongPtrW, GetWindowRect, GetWindowThreadProcessId, IsChild, IsIconic, IsWindow,
+    GetWindowLongPtrW, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, IsChild, IsIconic,
+    IsWindow,
     IsWindowVisible, SendMessageTimeoutW, SetParent, SetWindowLongPtrW, SetWindowPos, ShowWindow,
     GA_ROOT, GUITHREADINFO, GWL_EXSTYLE, GWL_STYLE, HWND_TOP, SMTO_NORMAL, SM_CXVIRTUALSCREEN,
     SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SWP_FRAMECHANGED, SWP_NOACTIVATE,
@@ -902,12 +903,117 @@ pub fn is_desktop_foreground() -> bool {
     }
 }
 
+/// 取窗口类名（空串表示取不到）。
+fn window_class(hwnd: HWND) -> String {
+    unsafe {
+        let mut buf = [0u16; 128];
+        let n = GetClassNameW(hwnd, &mut buf);
+        if n > 0 {
+            String::from_utf16_lossy(&buf[..n as usize])
+        } else {
+            String::new()
+        }
+    }
+}
+
+/// 这些窗口类属于 Windows 外壳 / 任务栏 / 开始菜单 / 桌面本身等「非应用」UI。
+///
+/// 它们出现在前台**不代表有应用在运行**：点任务栏、点桌面、开开始菜单、开任务视图都会让
+/// 此类窗口成为前台 —— 若把它们当成"应用"，`pauseWhenForeground`（前台有应用就暂停）就会
+/// 误暂停壁纸。实测：点桌面/任务栏时前台是 `Shell_TrayWnd`，壁纸被误暂停。
+///
+/// 清单参考 Lively 的 class 白名单（它同样把这些排除在全屏判定之外）。
+pub fn is_shell_class(class: &str) -> bool {
+    matches!(
+        class,
+        "Progman"
+            | "WorkerW"
+            | "SHELLDLL_DefView"
+            | "SysListView32"
+            | "Shell_TrayWnd"
+            | "Shell_SecondaryTrayWnd"
+            | "NotifyIconOverflowWindow"
+            | "TopLevelWindowForOverflowXamlIsland"
+            | "Windows.UI.Core.CoreWindow"
+            | "XamlExplorerHostIslandWindow"
+            | "WindowsDashboard"
+            | "MultitaskingViewFrame"
+            | "RainmeterMeterWindow"
+            | "_cls_desk_"
+    )
+}
+
+/// 这个窗口（或它的根祖先）是不是外壳窗口（见 [`is_shell_class`]）。
+pub fn is_shell_window(hwnd: HWND) -> bool {
+    if hwnd.is_invalid() {
+        return false;
+    }
+    if is_shell_class(&window_class(hwnd)) {
+        return true;
+    }
+    unsafe {
+        let root = GetAncestor(hwnd, GA_ROOT);
+        if !root.is_invalid() && root != hwnd {
+            return is_shell_class(&window_class(root));
+        }
+    }
+    false
+}
+
+/// 取窗口标题（截断、去控制字符，避免日志里出现换行）。
+fn window_title(hwnd: HWND) -> String {
+    unsafe {
+        let mut buf = [0u16; 256];
+        let n = GetWindowTextW(hwnd, &mut buf);
+        if n <= 0 {
+            return String::new();
+        }
+        let text = String::from_utf16_lossy(&buf[..n as usize]);
+        text.replace(['\r', '\n', '\t'], " ").trim().to_string()
+    }
+}
+
+/// 描述当前前台窗口（类名、类名链、PID、标题，以及我们的两个判定），用于排查
+/// 「点桌面却被判成前台有应用，于是自动暂停壁纸」这类问题。
+pub fn foreground_window_summary() -> String {
+    unsafe {
+        let fg = GetForegroundWindow();
+        if fg.is_invalid() {
+            return "前台窗口: <无>".to_string();
+        }
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(fg, Some(&mut pid));
+        // 往上爬几层类名，能看出前台是 SysListView32 还是 SHELLDLL_DefView / WorkerW 等
+        let mut chain: Vec<String> = Vec::new();
+        let mut cur = fg;
+        for _ in 0..6 {
+            if cur.is_invalid() {
+                break;
+            }
+            chain.push(window_class(cur));
+            let parent = GetParent(cur).unwrap_or_default();
+            if parent.is_invalid() || parent == cur {
+                break;
+            }
+            cur = parent;
+        }
+        format!(
+            "前台窗口: hwnd=0x{:x} pid={pid} class={} chain=[{}] title={:?} 判定桌面={} 判定壁纸={}",
+            fg.0 as isize,
+            window_class(fg),
+            chain.join(" < "),
+            window_title(fg),
+            is_desktop_foreground(),
+            is_wallpaper_window(fg),
+        )
+    }
+}
+
 /// 这个窗口本身是不是桌面外壳（Progman / WorkerW / 桌面图标层 `SHELLDLL_DefView`）。
 ///
 /// 与 `is_desktop_foreground` 的区别：那个判断的是「**前台**是不是桌面」，这里只判断
 /// 「传来的这个窗口句柄是不是桌面层」，用于遍历窗口时把桌面层排除出「覆盖了屏幕的应用」。
-pub fn is_desktop_window(hwnd: HWND) -> bool {
-    unsafe {
+pub fn is_desktop_window(hwnd: HWND) -> bool {    unsafe {
         if hwnd.is_invalid() {
             return false;
         }
@@ -1185,5 +1291,27 @@ mod tests {
     #[test]
     fn a_missing_window_is_not_alive() {
         assert!(!is_alive(0));
+    }
+
+    #[test]
+    fn shell_classes_are_not_treated_as_apps() {
+        // 任务栏、开始菜单、任务视图、托盘溢出、桌面 → 都不该算「应用」
+        for class in [
+            "Shell_TrayWnd",
+            "Shell_SecondaryTrayWnd",
+            "NotifyIconOverflowWindow",
+            "XamlExplorerHostIslandWindow",
+            "Windows.UI.Core.CoreWindow",
+            "Progman",
+            "WorkerW",
+            "SHELLDLL_DefView",
+            "SysListView32",
+        ] {
+            assert!(is_shell_class(class), "{class} 应视为外壳窗口");
+        }
+        // 普通应用窗口不能误判为外壳
+        for class in ["UnityWndClass", "Chrome_WidgetWin_1", "Notepad"] {
+            assert!(!is_shell_class(class), "{class} 不应视为外壳窗口");
+        }
     }
 }

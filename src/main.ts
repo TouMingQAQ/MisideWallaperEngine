@@ -76,7 +76,7 @@ function createTopBar(onOpenSettings: () => void): {
     h("div", { cls: "topbar__actions" }, volumeBox, settingsBtn),
   );
 
-  let version = "0.0.5";
+  let version = "0.0.7";
 
   function renderStatic(): void {
     brandName.textContent = t("app.title");
@@ -195,6 +195,46 @@ function rawToast(kind: "info" | "ok" | "warn" | "error", message: string): void
 }
 
 /* ======================================================================== *
+ * 界面侧崩溃捕捉：异常上报 + 心跳
+ * ======================================================================== */
+
+/**
+ * WebView 这一侧出事（JS 异常 / 渲染进程卡死）时，Rust 日志里是不会自动有记录的。
+ * 这里把未捕获异常报给后端，并每 3 秒发一次心跳 —— 后端看门狗发现心跳断了就能判定
+ * 「界面渲染进程崩了」，而不是只看到用户说「窗口没了」。
+ */
+function installCrashReporting(): void {
+  const report = (level: "error" | "warn", message: string): void => {
+    void api.uiLog(level, message).catch(() => {});
+  };
+
+  window.addEventListener("error", (event) => {
+    const detail =
+      event.error instanceof Error
+        ? `${event.error.message}\n${event.error.stack ?? ""}`
+        : String(event.message);
+    report(
+      "error",
+      `未捕获异常：${detail}（${event.filename}:${event.lineno}:${event.colno}）`,
+    );
+  });
+
+  window.addEventListener("unhandledrejection", (event) => {
+    const reason =
+      event.reason instanceof Error
+        ? `${event.reason.message}\n${event.reason.stack ?? ""}`
+        : String(event.reason);
+    report("error", `未处理的 Promise 拒绝：${reason}`);
+  });
+
+  const beat = (): void => {
+    void api.uiHeartbeat().catch(() => {});
+  };
+  beat();
+  window.setInterval(beat, 3000);
+}
+
+/* ======================================================================== *
  * 启动
  * ======================================================================== */
 
@@ -212,6 +252,7 @@ function boot(): void {
   }
 
   mountToasts(toastsHost);
+  installCrashReporting();
 
   /* ---- 弹窗 + 仪表盘 ---- */
   const dialog = createSettingsDialog();

@@ -16,6 +16,7 @@ use tauri_plugin_dialog::DialogExt;
 
 use crate::audio_link::{self, AudioStatus};
 use crate::capture::{self, ActiveCapture};
+use crate::crash;
 use crate::library::{self, WallpaperEntry};
 use crate::pac::{self, PacLibrary};
 use crate::prefs::{self, Settings};
@@ -37,8 +38,6 @@ const SCAN_INTERVAL: Duration = Duration::from_millis(250);
 const START_BACKOFF: Duration = Duration::from_secs(10);
 /// 内存里保留的日志条数。
 const MAX_LOGS: usize = 500;
-/// 日志文件上限（超过就轮转一次）。
-const MAX_LOG_BYTES: u64 = 2 * 1024 * 1024;
 
 /// 上一次记录的壁纸窗口几何摘要；变化时才写日志，避免每 250ms 刷屏。
 static LAST_GEOMETRY: Mutex<String> = Mutex::new(String::new());
@@ -106,6 +105,8 @@ pub struct AppState {
     capture: Mutex<Option<ActiveCapture>>,
     source: Mutex<SourceState>,
     logs: Mutex<Vec<LogLine>>,
+    /// 最近几次壁纸进程异常退出的摘要（最多 20 条），导出诊断时附上。
+    exits: Mutex<Vec<String>>,
 }
 
 impl Default for AppState {
@@ -118,6 +119,7 @@ impl Default for AppState {
             capture: Mutex::new(None),
             source: Mutex::new(SourceState::default()),
             logs: Mutex::new(Vec::new()),
+            exits: Mutex::new(Vec::new()),
         }
     }
 }
@@ -168,29 +170,9 @@ pub fn log<R: Runtime>(app: &AppHandle<R>, level: &str, message: impl Into<Strin
 
     let _ = app.emit(LOG_EVENT, &line);
 
-    if let Ok(dir) = app.path().app_log_dir() {
-        let _ = std::fs::create_dir_all(&dir);
-        let file = dir.join("host.log");
-        if std::fs::metadata(&file).map(|meta| meta.len()).unwrap_or(0) > MAX_LOG_BYTES {
-            let rotated = dir.join("host.log.1");
-            let _ = std::fs::remove_file(&rotated);
-            let _ = std::fs::rename(&file, &rotated);
-        }
-        if let Ok(mut handle) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&file)
-        {
-            use std::io::Write;
-            let _ = writeln!(
-                handle,
-                "[{}] {:<5} {}",
-                library::iso8601(std::time::SystemTime::now()),
-                level.to_uppercase(),
-                message
-            );
-        }
-    }
+    // 写盘统一走 crash::write_host_log：它和崩溃日志共用同一把锁与轮转规则，
+    // 免得两条路径同时改 host.log 把行写花。
+    crash::write_host_log(level, &message);
 }
 
 fn now_ms() -> u64 {
@@ -270,11 +252,17 @@ fn cleanup_orphan<R: Runtime>(app: &AppHandle<R>) {
         return;
     }
 
-    if let Some(hwnd) = desktop::find_main_window(record.pid) {
-        let _ = desktop::detach(hwnd);
-    }
+    let hwnd = desktop::find_main_window(record.pid);
     let _ = control::resume_process(record.pid);
-    match control::terminate_process(record.pid) {
+    // 先杀进程（窗口随进程销毁），再兜底 detach —— 避免对「上次被挂起、可能已无响应」
+    // 的旧壁纸窗口做 SetParent，把启动流程卡死。
+    let terminated = control::terminate_process(record.pid);
+    if let Some(hwnd) = hwnd {
+        let _ = desktop::detach(hwnd);
+    } else {
+        desktop::forget_attachment();
+    }
+    match terminated {
         Ok(()) => log(
             app,
             "warn",
@@ -586,14 +574,126 @@ fn spawn_monitor(app: AppHandle) {
         .name("wp-monitor".to_string())
         .spawn(move || loop {
             std::thread::sleep(SCAN_INTERVAL);
-            scan_once(&app);
+            // 心跳：看门狗靠它判断扫描线程还在不在跑
+            crash::beat();
+            // 单次 panic 不能把整条扫描线程带走 —— 那会让壁纸彻底失管，日志里却只剩
+            // 「壁纸不动了」。捕获住、记下来、继续跑。
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| scan_once(&app)));
+            if outcome.is_err() {
+                log(
+                    &app,
+                    "error",
+                    format!(
+                        "扫描线程捕获到 panic（已继续运行）｜ 当时阶段：{}",
+                        crash::current_stage()
+                    ),
+                );
+            }
         })
         .expect("无法创建后台扫描线程");
+}
+
+/// 壁纸进程退出时把「怎么退的」写进日志与现场文件。
+///
+/// 这一条是排查「运行一会儿就崩」的核心：退出码能区分正常退出 / 被强杀 / Unity 自己
+/// 崩了；再加上 Windows 应用日志里的崩溃记录（含出错模块）和 Unity 的 `Player.log`
+/// 尾部，基本能直接看出原因。
+fn report_wallpaper_exit(app: &AppHandle, state: &AppState, report: crate::unity::ExitReport) {
+    let exe_name = std::path::Path::new(&report.exe)
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_default();
+
+    let mut summary = format!(
+        "壁纸进程退出：PID {} ｜ 退出码 {} ｜ 运行 {} ｜ 峰值内存 {:.1} MB ｜ {} ｜ 退出前{}",
+        report.pid,
+        crash::describe_exit_code(report.code),
+        format_duration(report.uptime_ms),
+        report.peak_memory_mb,
+        if report.was_desktop {
+            "桌面模式"
+        } else {
+            "预览模式"
+        },
+        if report.was_paused {
+            "处于暂停（进程挂起）"
+        } else {
+            "未暂停"
+        },
+    );
+    if !report.last_error.is_empty() {
+        summary.push_str(&format!(" ｜ 最后错误：{}", report.last_error));
+    }
+
+    log(app, "error", summary.clone());
+    crash::write_crash("壁纸进程退出", &summary);
+    {
+        let mut exits = lock(&state.exits);
+        exits.push(format!(
+            "[{}] {}",
+            library::iso8601(std::time::SystemTime::now()),
+            summary
+        ));
+        while exits.len() > 20 {
+            exits.remove(0);
+        }
+    }
+
+    // 现场一：Windows「应用程序」日志里的崩溃 / 挂起记录
+    let events = crash::recent_application_crashes(&[exe_name.as_str()], 15);
+    // 现场二：Unity 自己的 Player.log 与崩溃目录
+    let unity = crash::unity_crash_artifacts(&report.exe);
+
+    let mut body = summary.clone();
+    body.push_str(&format!(
+        "\n\n--- Windows 应用日志（最近 15 分钟，含 {exe_name}） ---\n"
+    ));
+    if events.is_empty() {
+        body.push_str("（没有找到相关的崩溃 / 挂起记录）\n");
+    } else {
+        body.push_str(&events);
+        body.push('\n');
+    }
+    body.push_str("\n--- Unity 崩溃现场 ---\n");
+    if unity.is_empty() {
+        body.push_str("（没有找到 Unity 日志或崩溃目录）\n");
+    } else {
+        body.push_str(&unity);
+    }
+
+    match crash::write_incident("wallpaper-exit", &body) {
+        Some(path) => {
+            let extra = if events.is_empty() {
+                ""
+            } else {
+                "；Windows 事件日志里发现了相关崩溃记录"
+            };
+            log(
+                app,
+                "error",
+                format!("崩溃现场已保存：{}{}", path.display(), extra),
+            );
+        }
+        None => log(app, "warn", "崩溃现场写入失败（日志目录不可写）"),
+    }
+}
+
+fn format_duration(ms: u64) -> String {
+    let total = ms / 1000;
+    let (hours, minutes, seconds) = (total / 3600, (total % 3600) / 60, total % 60);
+    if hours > 0 {
+        format!("{hours} 小时 {minutes} 分 {seconds} 秒")
+    } else if minutes > 0 {
+        format!("{minutes} 分 {seconds} 秒")
+    } else {
+        format!("{seconds} 秒")
+    }
 }
 
 fn scan_once(app: &AppHandle) {
     let state = app.state::<AppState>();
     let settings = state.settings();
+    crash::set_stage("采样系统状态");
     let system = control::system_state(&settings);
 
     // 诊断：前台是否被判定为「应用」发生变化时，记一条前台窗口详情。
@@ -616,7 +716,8 @@ fn scan_once(app: &AppHandle) {
     }
 
     // 1. 壁纸进程
-    let (snapshot, auto_pause_note, attached_changed) = {
+    crash::set_stage("同步壁纸进程/窗口");
+    let (snapshot, auto_pause_note, attached_changed, exit_report) = {
         let mut host = lock(&state.host);
         let previous = host.state();
         let was_auto_paused = previous.auto_paused;
@@ -634,8 +735,12 @@ fn scan_once(app: &AppHandle) {
             None
         };
         let attached_changed = snapshot.attached != was_attached;
-        (snapshot, note, attached_changed)
+        let exit_report = host.take_exit_report();
+        (snapshot, note, attached_changed, exit_report)
     };
+    if let Some(report) = exit_report {
+        report_wallpaper_exit(app, &state, report);
+    }
     if let Some(note) = auto_pause_note {
         log(app, "info", note);
     }
@@ -688,10 +793,13 @@ fn scan_once(app: &AppHandle) {
     );
 
     // 2. 音频源
+    crash::set_stage("同步音频源");
     sync_audio(app, &state, &settings);
 
     // 3. 托盘
+    crash::set_stage("同步托盘");
     crate::tray::sync(app);
+    crash::set_stage("空闲");
 }
 
 /* ------------------------------------------------------------------ 命令 */
@@ -874,21 +982,37 @@ fn import_zip(
     }
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn remove_wallpaper(
     app: AppHandle,
     state: State<'_, AppState>,
     id: String,
 ) -> Result<Vec<WallpaperEntry>, String> {
+    // 整个删除流程放在命令线程（async）里跑：结束壁纸进程 + 删几个 GB 的目录都可能耗时，
+    // 绝不能占住界面主线程，否则窗口会「未响应」甚至被 Windows 直接关掉。
+    let started = Instant::now();
     let mut settings = state.settings();
     // 正在跑的壁纸先停掉，否则文件被占用删不干净
     if settings.active_wallpaper == id {
-        let mut host = lock(&state.host);
-        if host.mode() != Mode::Stopped {
-            host.stop();
+        log(&app, "info", format!("删除壁纸 {id}：先停止正在运行的壁纸…"));
+        {
+            let mut host = lock(&state.host);
+            if host.mode() != Mode::Stopped {
+                host.stop();
+            }
         }
-        drop(host);
         forget_running(&app);
+        // 明确广播一次停止后的状态，别让界面在下一轮扫描前还显示旧壁纸
+        let snapshot = state.runtime();
+        let _ = app.emit(STATE_EVENT, &snapshot);
+        log(
+            &app,
+            "info",
+            format!(
+                "删除壁纸 {id}：壁纸已停止（耗时 {:.2} 秒）",
+                started.elapsed().as_secs_f64()
+            ),
+        );
     }
     let result = library::remove(&app, &settings, &id);
     if result.is_ok() {
@@ -900,7 +1024,14 @@ fn remove_wallpaper(
             state.set_settings(settings.clone());
             prefs::broadcast(&app, &settings);
         }
-        log(&app, "info", format!("已删除壁纸 {id}"));
+        log(
+            &app,
+            "info",
+            format!(
+                "已删除壁纸 {id}（总耗时 {:.2} 秒）",
+                started.elapsed().as_secs_f64()
+            ),
+        );
     } else if let Err(err) = &result {
         log(&app, "error", format!("删除失败：{err}"));
     }
@@ -1001,8 +1132,10 @@ fn apply_wallpaper(app: AppHandle, id: String) -> Result<RuntimeState, String> {
     launch(&app, &state, &id, Mode::Desktop)
 }
 
-#[tauri::command]
+#[tauri::command(async)]
 fn stop_wallpaper(app: AppHandle, state: State<'_, AppState>) -> RuntimeState {
+    // async：结束进程可能涉及跨进程窗口操作，不能堵在界面主线程上
+    let started = Instant::now();
     {
         let mut host = lock(&state.host);
         host.stop();
@@ -1010,7 +1143,11 @@ fn stop_wallpaper(app: AppHandle, state: State<'_, AppState>) -> RuntimeState {
     forget_running(&app);
     let snapshot = state.runtime();
     let _ = app.emit(STATE_EVENT, &snapshot);
-    log(&app, "info", "已停止壁纸");
+    log(
+        &app,
+        "info",
+        format!("已停止壁纸（耗时 {:.2} 秒）", started.elapsed().as_secs_f64()),
+    );
     snapshot
 }
 
@@ -1102,10 +1239,14 @@ const THUMBNAIL_WIDTH: i32 = 720;
 /// 用 `PrintWindow` 抓 DirectX 独占渲染的窗口时经常只能拿到全黑，这种情况按抓不到处理，
 /// 界面显示占位而不是一块黑屏。
 #[tauri::command(async)]
-fn wallpaper_thumbnail(state: State<'_, AppState>) -> tauri::ipc::Response {
+fn wallpaper_thumbnail(app: AppHandle, state: State<'_, AppState>) -> tauri::ipc::Response {
     let (hwnd, paused) = {
-        let host = lock(&state.host);
-        (host.hwnd(), host.state().paused)
+        // 用 try_lock：万一后台扫描线程正卡在某个跨进程窗口调用上（手里还攥着 host 锁），
+        // 这里宁可这一帧不抓，也不要让 IPC 线程排在锁上一起卡死。
+        match state.host.try_lock() {
+            Ok(host) => (host.hwnd(), host.state().paused),
+            Err(_) => return tauri::ipc::Response::new(Vec::new()),
+        }
     };
     // 被挂起的进程不会响应 PrintWindow，硬抓会把宿主线程一起拖住
     if paused {
@@ -1115,15 +1256,40 @@ fn wallpaper_thumbnail(state: State<'_, AppState>) -> tauri::ipc::Response {
         return tauri::ipc::Response::new(Vec::new());
     };
 
-    match desktop::capture_thumbnail(hwnd, THUMBNAIL_WIDTH) {
-        Some(thumb) => {
+    match desktop::capture_thumbnail_guarded(
+        hwnd.0 as isize,
+        THUMBNAIL_WIDTH,
+        Duration::from_millis(1500),
+    ) {
+        desktop::ThumbnailOutcome::Got(thumb) => {
             let mut payload = Vec::with_capacity(thumb.rgba.len() + 8);
             payload.extend_from_slice(&thumb.width.to_le_bytes());
             payload.extend_from_slice(&thumb.height.to_le_bytes());
             payload.extend_from_slice(&thumb.rgba);
             tauri::ipc::Response::new(payload)
         }
-        None => tauri::ipc::Response::new(Vec::new()),
+        desktop::ThumbnailOutcome::Timeout => {
+            // 这是「壁纸/宿主卡死」最常见的直接原因：抓图线程等不到窗口响应
+            static LAST_WARN: Mutex<Option<Instant>> = Mutex::new(None);
+            let mut last = lock(&LAST_WARN);
+            let due = last
+                .map(|at: Instant| at.elapsed() >= Duration::from_secs(30))
+                .unwrap_or(true);
+            if due {
+                *last = Some(Instant::now());
+                drop(last);
+                log(
+                    &app,
+                    "warn",
+                    format!(
+                        "壁纸窗口缩略图抓取超时 1500ms（窗口可能卡死/无响应，已跳过本帧）｜ {}",
+                        desktop::window_geometry_summary(hwnd.0 as isize)
+                    ),
+                );
+            }
+            tauri::ipc::Response::new(Vec::new())
+        }
+        _ => tauri::ipc::Response::new(Vec::new()),
     }
 }
 
@@ -1305,6 +1471,27 @@ fn open_log_dir(app: AppHandle) -> Result<(), String> {
         .map_err(|e| format!("打开日志目录失败：{e}"))
 }
 
+/// 前端（WebView）把 JS 异常 / 未处理的 Promise 拒绝报上来。
+///
+/// 界面这一侧崩掉时，Rust 日志里什么都不会有；有了这条，至少能知道「是界面的错」
+/// 以及错误信息本身。
+#[tauri::command]
+fn ui_log(app: AppHandle, level: String, message: String) {
+    let level = match level.as_str() {
+        "error" => "error",
+        "warn" => "warn",
+        _ => "info",
+    };
+    let message: String = message.chars().take(4000).collect();
+    log(&app, level, format!("[界面] {message}"));
+}
+
+/// 前端心跳：渲染进程卡死 / 崩溃时，看门狗靠它发现（见 `crash::spawn_watchdog`）。
+#[tauri::command]
+fn ui_heartbeat() {
+    crash::ui_beat();
+}
+
 /// 导出诊断日志：把系统环境、显示器/DPI、窗口几何、设置、运行状态、内存日志与磁盘日志
 /// 打包成一个 zip，让用户选位置保存后发回分析。
 #[tauri::command(async)]
@@ -1349,6 +1536,61 @@ fn export_diagnostics(app: AppHandle, state: State<'_, AppState>) -> Result<Stri
         }
     }
 
+    // ---- 崩溃排查专区 ----
+    text.push_str("\n\n--- 最近的壁纸进程退出 ---\n");
+    {
+        let exits = lock(&state.exits);
+        if exits.is_empty() {
+            text.push_str("（本次运行没有记录到壁纸进程退出）\n");
+        } else {
+            for line in exits.iter() {
+                text.push_str(line);
+                text.push('\n');
+            }
+        }
+    }
+
+    text.push_str("\n\n--- Windows 应用日志（崩溃 / 挂起，最近 7 天） ---\n");
+    {
+        let wall_name = std::path::Path::new(&runtime.exe)
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let events = crash::recent_application_crashes(
+            &[wall_name.as_str(), "miside-wallpaper-engine.exe"],
+            7 * 24 * 60,
+        );
+        if events.is_empty() {
+            text.push_str("（没有找到相关记录）\n");
+        } else {
+            text.push_str(&events);
+            text.push('\n');
+        }
+    }
+
+    text.push_str("\n\n--- Unity 崩溃现场 ---\n");
+    if runtime.exe.is_empty() {
+        text.push_str("（当前没有运行中的壁纸）\n");
+    } else {
+        let unity = crash::unity_crash_artifacts(&runtime.exe);
+        text.push_str(if unity.is_empty() {
+            "（没有找到 Unity 日志或崩溃目录）\n"
+        } else {
+            &unity
+        });
+    }
+
+    if let Some(dir) = crash::log_dir() {
+        if let Ok(bytes) = std::fs::read(dir.join("crash.log")) {
+            let tail_text = String::from_utf8_lossy(&bytes).into_owned();
+            let lines: Vec<&str> = tail_text.lines().collect();
+            let start = lines.len().saturating_sub(200);
+            text.push_str("\n\n--- crash.log（尾部） ---\n");
+            text.push_str(&lines[start..].join("\n"));
+            text.push('\n');
+        }
+    }
+
     // 默认文件名：带时间戳，方便区分多次导出
     let stamp: String = library::iso8601(std::time::SystemTime::now())
         .chars()
@@ -1384,7 +1626,7 @@ fn export_diagnostics(app: AppHandle, state: State<'_, AppState>) -> Result<Stri
             .map_err(|e| format!("写入诊断文本失败：{e}"))?;
 
         if let Ok(dir) = app.path().app_log_dir() {
-            for name in ["host.log", "host.log.1"] {
+            for name in ["host.log", "host.log.1", "crash.log", "crash.log.1"] {
                 if let Ok(bytes) = std::fs::read(dir.join(name)) {
                     writer
                         .start_file(name, options)
@@ -1392,6 +1634,32 @@ fn export_diagnostics(app: AppHandle, state: State<'_, AppState>) -> Result<Stri
                     writer
                         .write_all(&bytes)
                         .map_err(|e| format!("写入 {name} 失败：{e}"))?;
+                }
+            }
+            // 崩溃现场文件与 minidump：排查「为什么崩」的关键证据
+            if let Ok(entries) = std::fs::read_dir(&dir) {
+                for entry in entries.flatten() {
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    let is_incident = name.starts_with("crash-")
+                        && (name.ends_with(".txt") || name.ends_with(".dmp"));
+                    if !is_incident {
+                        continue;
+                    }
+                    let Ok(meta) = entry.metadata() else {
+                        continue;
+                    };
+                    // 单个转储超过 64MB 就不塞进 zip（避免导出变得极慢），只留名字提示
+                    if meta.len() > 64 * 1024 * 1024 {
+                        continue;
+                    }
+                    if let Ok(bytes) = std::fs::read(entry.path()) {
+                        writer
+                            .start_file(name, options)
+                            .map_err(|e| format!("写入崩溃现场失败：{e}"))?;
+                        writer
+                            .write_all(&bytes)
+                            .map_err(|e| format!("写入崩溃现场失败：{e}"))?;
+                    }
                 }
             }
         }
@@ -1406,6 +1674,11 @@ fn export_diagnostics(app: AppHandle, state: State<'_, AppState>) -> Result<Stri
 /* ------------------------------------------------------------------ 入口 */
 /// 构建并运行应用。
 pub fn run_app() {
+    // 崩溃捕捉要赶在所有业务线程之前装好：GUI 版本没有控制台，panic 默认输出会丢，
+    // 访问违例则是直接把进程带走 —— 不先挂上钩子，日志里就永远只有「上次运行到一半」。
+    crash::install_panic_hook();
+    crash::install_exception_filter();
+
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
             if let Some(window) = app.get_webview_window("main") {
@@ -1445,11 +1718,22 @@ pub fn run_app() {
             set_autostart,
             open_log_dir,
             export_diagnostics,
+            ui_log,
+            ui_heartbeat,
         ])
         .setup(|app| {
             let handle = app.handle().clone();
+            // 日志目录 / 心跳先就位，后面所有线程都靠它写盘
+            crash::init(&handle);
+
             let settings = prefs::load(&handle);
             app.state::<AppState>().set_settings(settings.clone());
+
+            // 上次是不是没正常退出？（session.json 还在 = 崩溃 / 被强杀）
+            if let Some(previous) = crash::take_previous_session(&handle) {
+                log(&handle, "warn", format!("检测到上次异常退出：{previous}"));
+            }
+            crash::mark_session_start(&handle);
 
             // 音频链路与推流线程
             audio_link::configure(&settings);
@@ -1464,6 +1748,9 @@ pub fn run_app() {
 
             // 后台扫描
             spawn_monitor(handle.clone());
+
+            // 看门狗：扫描线程 / 界面线程 / WebView 谁卡住了都要留痕
+            crash::spawn_watchdog(handle.clone());
 
             log(
                 &handle,
@@ -1557,4 +1844,7 @@ fn cleanup_once(app: &AppHandle, reason: &str) {
         ),
     );
     shutdown_cleanup(app);
+    // 正常退出：把会话标记清掉，下次启动就不会误报「上次异常退出」
+    crash::clear_session(app);
+    log(app, "info", "退出清理 · 会话标记已清除");
 }

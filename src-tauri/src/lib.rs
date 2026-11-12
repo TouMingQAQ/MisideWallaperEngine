@@ -12,6 +12,7 @@ pub mod audio_link;
 pub mod beat;
 pub mod capture;
 pub mod commands;
+pub mod crash;
 pub mod dsp;
 pub mod library;
 pub mod pac;

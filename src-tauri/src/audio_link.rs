@@ -547,7 +547,14 @@ pub fn spawn_pump<R: Runtime>(app: AppHandle<R>) {
         .name("audio-link-pump".to_string())
         .spawn(move || loop {
             std::thread::sleep(PUMP_INTERVAL);
-            pump_once(&app);
+            // 单次 panic 不该让推流线程默默死掉（那会表现为「壁纸还在但节奏不推了」）
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| pump_once(&app)));
+            if outcome.is_err() {
+                crate::crash::write_crash(
+                    "音频推流线程 panic",
+                    "pump_once 捕获到 panic（已继续运行）",
+                );
+            }
         })
         .expect("无法创建音频推流线程");
 }

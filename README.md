@@ -120,7 +120,7 @@ git push origin main --tags
 | | 显示器 | 全部显示器（整个虚拟桌面）或指定某一块（默认只铺主显示器） |
 | | 额外启动参数 | 原样拼在 Unity 启动命令行后面 |
 | | 暂停 / 重载 | 暂停 = 挂起进程（`NtSuspendProcess`），恢复即继续；重载 = 重启进程 |
-| 暂停条件 | 全屏应用时 / 电池供电时 / 前台窗口最大化时 | 命中条件自动挂起壁纸，条件消失自动恢复。全屏判定用 `SHQueryUserNotificationState`，但**不把 `QUNS_BUSY` 单独当全屏**（切换窗口、Alt+Tab、开开始菜单时外壳会短暂报忙），还要求前台真有一个盖满显示器的窗口；另外条件必须**连续满足 3 秒**才生效 —— 否则会出现"切个窗口壁纸就停一下"。每次自动暂停/恢复都会写日志并带上原因 |
+| 暂停条件 | 应用遮挡 / 电池供电 / 节能模式 / 前台有应用 | 命中条件自动挂起壁纸，条件消失自动恢复。遮挡算法可选 `grid` / `foreground` / `all` / `gamemode`；桌面重新成为前台时会立即解除“遮挡”判定，不会因为后台仍有可见的无边框全屏游戏而一直暂停。条件需短暂连续满足才生效，避免 Alt+Tab 时壁纸闪停。每次自动暂停/恢复都会写日志并带上原因 |
 | 输入 | 转发鼠标键盘 | 桌面在前台时，把鼠标与键盘事件**合成窗口消息**发给壁纸窗口；**不抢前台焦点**，桌面图标照常可点可拖 |
 | | 锁定 | 完全不转发：壁纸只显示、不响应，点桌面不会误触它 |
 | 系统 | 开机自启 | 写 `HKCU\...\CurrentVersion\Run`，以设置文件为准自动纠正 |
@@ -204,10 +204,11 @@ Unity 端零原生插件，一个 `UdpClient` 就行。
 
 | 模块 | 负责 |
 | --- | --- |
-| `commands.rs` | 应用状态、26 个 IPC 命令、后台扫描（壁纸进程 + 音频源编排 + 托盘刷新）、日志 |
+| `commands.rs` | 应用状态、IPC 命令、后台扫描（壁纸进程 + 音频源编排 + 托盘刷新）、日志 |
+| `crash.rs` | 崩溃 / 卡死捕捉：panic 钩子、原生异常 minidump、看门狗心跳、壁纸退出码、Unity 日志摘取、会话标记 |
 | `library.rs` | zip 导入/索引/删除/改名；UTF-8 优先、GBK 回退解码；绝对路径与 `..` 一律拒绝 |
-| `unity.rs` | Unity 启动参数、进程挂起/恢复、状态机、几何与音量同步 |
-| `win/desktop.rs` | WorkerW 发现（含 Win11 24H2 回退）、`SetParent`、坐标换算、显示器枚举、主窗口查找、`PrintWindow` 缩略图 |
+| `unity.rs` | Unity 启动参数、进程挂起/恢复、状态机、几何与音量同步、进程退出现场 |
+| `win/desktop.rs` | WorkerW 发现（含 Win11 24H2 回退）、`SetParent`、坐标换算、显示器枚举、主窗口查找、带超时的 `PrintWindow` 缩略图 |
 | `win/input.rs` | `WH_MOUSE_LL` + `WH_KEYBOARD_LL` 钩子 → 合成窗口消息；归还被抢走的鼠标捕获；只在桌面前台开闸，不抢焦点 |
 | `win/control.rs` | `SHQueryUserNotificationState` 全屏判定、`GetSystemPowerStatus` 电池、WASAPI 会话音量、`NtSuspendProcess`、注册表自启、Job Object 进程归属、按 PID 杀进程 |
 | `audio_link.rs` | UDP 三类包发送 + 1Hz 状态广播 |
@@ -217,6 +218,40 @@ Unity 端零原生插件，一个 `UdpClient` 就行。
 `wp://audio-frame`（≤30fps 给界面画图：频谱 + 波形 + 电平 + 节拍/BPM）、
 `wp://audio-status`、`wp://settings`、`wp://monitor`（全屏/电池/遮挡）、`wp://log`。
 主界面的壁纸实时预览另走命令 `wallpaper_thumbnail`（裸二进制 RGBA，空 = 抓不到）。
+
+---
+
+## 崩溃 / 卡死怎么查
+
+「运行一会儿就崩」这类问题最怕日志里什么都没有。v0.0.6 起宿主会把这些都记下来，
+统一放在 `<app_log_dir>`（`%LOCALAPPDATA%\com.toumingqaq.miside-wallpaper-engine\logs`）：
+
+| 文件 | 内容 |
+| --- | --- |
+| `host.log` / `host.log.1` | 常规运行日志（滚动，单文件 ≤2MB） |
+| `crash.log` / `crash.log.1` | 崩溃专区：panic、原生异常、界面/扫描线程卡死、壁纸进程异常退出 |
+| `crash-<时间>-*.txt` | 单个事件的现场文件：退出码、Windows 事件日志摘要、Unity `Player.log` 尾部、操作轨迹 |
+| `crash-<时间>.dmp` | 宿主原生崩溃（访问违例等）的 minidump，可用 WinDbg / Visual Studio 打开 |
+| `session.json`（在 `%APPDATA%\...`） | 会话标记；正常退出会删除，启动时发现它还在 = 上次崩溃 / 被强杀 |
+
+具体捕捉点：
+
+* **Rust panic**：任何线程 panic 都会写 `crash.log`（线程名 + 文件:行号 + 回溯）；
+  扫描线程和音频推流线程还额外用 `catch_unwind` 兜住，单次 panic 不会让它们悄悄死掉；
+* **原生崩溃**：`SetUnhandledExceptionFilter` 记录异常码（如 `0xC0000005` 访问冲突）、
+  出错模块与偏移，并落一份 minidump；
+* **卡死**：看门狗每 2 秒检查「扫描线程 / 界面主线程 / WebView」三个心跳，谁停摆就写
+  「卡了多久、卡在哪一步」——Windows 事件日志里的 `AppHangXProcB1` 通常就是这里抓到的；
+* **壁纸进程退出**：记录**退出码**（`0xC0000005` = 访问冲突、`0xE06D7363` = C++ 未捕获异常…）、
+  运行时长、峰值内存、退出前是否被挂起，并自动附上 Windows「应用程序」日志里的
+  崩溃/挂起记录与 Unity 自己的 `Player.log` 尾部；
+* **界面侧异常**：前端把 JS 未捕获异常 / 未处理 Promise 上报成 `[界面] ...` 日志，每 3 秒一次心跳。
+
+排查步骤：复现后打开「设置 → 关于 → 导出诊断日志」，把 zip 发回即可 —— 里面已经包含
+`host.log`、`crash.log`、现场 `.txt`、minidump 以及系统/DPI/窗口几何信息。
+
+> `wallpaper_thumbnail` 现在把 `PrintWindow` 放到独立线程并带 1500ms 超时：壁纸窗口若卡死，
+> 抓图会超时跳过并记一条 warning，而不是把宿主线程一起拖住。
 
 ---
 
@@ -233,7 +268,9 @@ Unity 端零原生插件，一个 `UdpClient` 就行。
   （或自己也不处理），这两项就只是"设了没效果"；渲染倍率还有平台限制 —— Windows 独立平台的动态
   分辨率只支持 DirectX 12；
 * **暂停是进程挂起**：`NtSuspendProcess` 属未公开 API，实测稳定，但极端情况下可能让某些自制渲染循环
-  在恢复后需要一点时间回到正常节奏；不需要就关掉暂停条件；
+  在恢复后需要一点时间回到正常节奏；不需要就关掉暂停条件。挂起期间宿主**不做任何跨进程窗口操作**
+  （`SetParent` / `SetWindowPos` / `ShowWindow`…）：被挂起的窗口线程不处理消息，这些同步调用会把宿主
+  甚至 explorer 拖进「无响应」（事件日志里的 `AppHangXProcB1`）；
 * **音量在壁纸出声前设置不上去**：Unity 没产生音频会话时 WASAPI 找不到它，宿主会每 2 秒重试，
   界面显示的是你的目标值；
 * **输入转发只在桌面是前台时生效**（和 Lively 一样的规则）：否则全系统的鼠标移动都会涌进壁纸窗口；

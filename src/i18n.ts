@@ -217,7 +217,7 @@ const zhCN = {
   "settings.groupPause": "暂停条件",
   "settings.pauseOnFullscreen": "有应用遮挡桌面时暂停",
   "settings.pauseOnFullscreenHint":
-    "检测到有应用盖住桌面（全屏程序、无边框游戏等）时挂起壁纸。按下面的「检测算法」判断；条件要连续满足一小会儿才生效，切换窗口、Alt+Tab 这类一闪而过的信号不会让壁纸停一下。",
+    "检测到有应用盖住桌面（全屏程序、无边框游戏等）时挂起壁纸。按下面的「检测算法」判断；条件要连续满足一小会儿才生效，切换窗口、Alt+Tab 这类一闪而过的信号不会让壁纸停一下。回到桌面后会立即解除遮挡暂停，即使后台的全屏游戏窗口仍然存在。",
   "settings.pauseAlgorithm": "遮挡检测算法",
   "settings.pauseAlgorithmHint":
     "grid：多个窗口拼起来盖满屏幕也算（推荐）；foreground：只看前台窗口；all：任一窗口盖满就算；gamemode：只认独占全屏游戏。",
@@ -534,7 +534,7 @@ const enUS: Record<I18nKey, string> = {
   "settings.groupPause": "Pause conditions",
   "settings.pauseOnFullscreen": "Pause when an app covers the desktop",
   "settings.pauseOnFullscreenHint":
-    "Suspend the wallpaper when an app covers the desktop (fullscreen apps, borderless games, etc.), decided by the detection algorithm below. The condition must hold briefly before it takes effect, so brief signals such as Alt+Tab no longer stop the wallpaper.",
+    "Suspend the wallpaper when an app covers the desktop (fullscreen apps, borderless games, etc.), decided by the detection algorithm below. The condition must hold briefly before it takes effect, so brief signals such as Alt+Tab no longer stop the wallpaper. Returning to the desktop immediately clears this pause, even if a borderless fullscreen game is still running behind it.",
   "settings.pauseAlgorithm": "Coverage detection algorithm",
   "settings.pauseAlgorithmHint":
     "grid: multiple windows tiled together can cover the screen (recommended); foreground: only the foreground window; all: any single window; gamemode: exclusive-fullscreen games only.",

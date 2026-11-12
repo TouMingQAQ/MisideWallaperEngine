@@ -471,6 +471,13 @@ export const api = {
 
   /** 导出诊断日志（打包系统/DPI/几何/日志等），返回保存路径；取消则 rejected */
   exportDiagnostics: () => call<string>("export_diagnostics"),
+
+  /** 把界面侧异常写进后端日志（崩溃排查用） */
+  uiLog: (level: "error" | "warn" | "info", message: string) =>
+    call<void>("ui_log", { level, message }),
+
+  /** 界面心跳：渲染进程卡死/崩溃时后端看门狗能发现 */
+  uiHeartbeat: () => call<void>("ui_heartbeat"),
 };
 
 /* ======================================================================== *

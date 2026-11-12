@@ -60,12 +60,13 @@ pub struct SystemState {
 
 /// 采样一次系统状态。`settings` 用来决定用哪种覆盖算法。
 pub fn system_state(settings: &Settings) -> SystemState {
+    let desktop_foreground = desktop::is_desktop_foreground();
     SystemState {
-        covered: monitor_covered(settings),
+        covered: monitor_covered(settings, desktop_foreground),
         foreground_app: foreground_is_app(),
         on_battery: is_on_battery(),
         on_battery_saver: is_battery_saver_on(),
-        desktop_foreground: desktop::is_desktop_foreground(),
+        desktop_foreground,
     }
 }
 
@@ -77,7 +78,15 @@ pub fn system_state(settings: &Settings) -> SystemState {
 /// * `all` —— 任一可见窗口最大化或盖满 ≥95% 目标屏就算；
 /// * `grid`（默认）—— 多个窗口**拼起来**盖满 ≥95% 才算（把两个半屏窗口也认定为遮挡）。
 ///   单窗口、或任意窗口最大化时同样直接算覆盖。
-pub fn monitor_covered(settings: &Settings) -> bool {
+///
+/// 桌面已经是前台时永远不算被遮挡。无边框全屏游戏在 Alt+Tab / Win+D 回到桌面后，
+/// 它的窗口通常仍然满足 `IsWindowVisible`，只是被桌面盖在了下面；如果继续把它算进
+/// 覆盖面积，壁纸就会一直保持暂停，直到游戏进程退出。这正是“切回桌面后壁纸卡死、
+/// 重启壁纸也没用，关掉游戏才恢复”的根因。
+pub fn monitor_covered(settings: &Settings, desktop_foreground: bool) -> bool {
+    if desktop_foreground {
+        return false;
+    }
     if settings.pause_algorithm == "gamemode" {
         return gamemode_fullscreen();
     }
@@ -718,4 +727,23 @@ impl Drop for KillOnCloseJob {
 #[allow(dead_code)]
 fn _unused() {
     let _ = s!("miside-wallpaper-engine");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn desktop_foreground_never_counts_as_screen_coverage() {
+        for algorithm in ["grid", "foreground", "all", "gamemode"] {
+            let settings = Settings {
+                pause_algorithm: algorithm.to_string(),
+                ..Settings::default()
+            };
+            assert!(
+                !monitor_covered(&settings, true),
+                "{algorithm} 不应在桌面已经回到前台时继续判定为被遮挡"
+            );
+        }
+    }
 }

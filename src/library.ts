@@ -278,11 +278,9 @@ export function createLibraryTab(): Tab {
         });
         if (!yes) return;
         await withBusy(removeBtn, async () => {
-          // 正在使用这个壁纸时先停掉，避免文件被占用删不干净
-          if (getRuntime().wallpaperId === entry.id) {
-            const stopped = await store.stop();
-            if (stopped === null) return; // 停止失败已在 store 里提示过
-          }
+          // 正在运行的壁纸由后端在删除时一并停止（remove_wallpaper 是 async 命令，
+          // 不会阻塞界面）。这里不再单独调 stop：否则会连续做两遍「跨进程停窗口」，
+          // 正是「删除正在运行的壁纸时卡死」的旧坑。
           const res = await api.removeWallpaper(entry.id);
           if (!res.ok) {
             reportFailure(res, t("library.card.remove"));

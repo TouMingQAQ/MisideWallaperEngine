@@ -33,10 +33,11 @@ use windows::Win32::UI::HiDpi::{
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, FindWindowExW, FindWindowW, GetAncestor, GetClassNameW, GetClientRect,
     GetForegroundWindow, GetGUIThreadInfo, GetParent, GetShellWindow, GetSystemMetrics,
-    GetWindowLongPtrW, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, IsChild, IsIconic,
-    IsWindow,
+    GetWindowLongPtrW, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, IsChild,
+    IsHungAppWindow, IsIconic, IsWindow,
     IsWindowVisible, SendMessageTimeoutW, SetParent, SetWindowLongPtrW, SetWindowPos, ShowWindow,
-    GA_ROOT, GUITHREADINFO, GWL_EXSTYLE, GWL_STYLE, HWND_TOP, SMTO_NORMAL, SM_CXVIRTUALSCREEN,
+    GA_ROOT, GUITHREADINFO, GWL_EXSTYLE, GWL_STYLE, HWND_TOP, SMTO_ABORTIFHUNG, SMTO_NORMAL,
+    SM_CXVIRTUALSCREEN,
     SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, SWP_FRAMECHANGED, SWP_NOACTIVATE,
     SWP_SHOWWINDOW, SW_SHOW, SW_SHOWNOACTIVATE, WS_CAPTION, WS_CHILD, WS_EX_APPWINDOW,
     WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU,
@@ -189,10 +190,47 @@ fn pick_best_worker(candidates: &[HWND]) -> Option<HWND> {
 
 /* --------------------------------------------------------------- 挂载 */
 
+/// 窗口是否「无响应」（超过约 5 秒没处理窗口消息，或用 WM_NULL 探测超时）。
+///
+/// 对无响应窗口做 `SetParent` / `SetWindowPos` / `ShowWindow` 这类**跨进程同步调用**时，
+/// Windows 会一直等对方回消息，把调用线程（严重时连 explorer）一起拖成「无响应」，
+/// 也就是事件日志里的 `AppHangXProcB1`。所有跨进程窗口操作前都先问一句，能绕就绕。
+pub fn is_window_hung(hwnd: HWND) -> bool {
+    if hwnd.is_invalid() || !unsafe { IsWindow(Some(hwnd)).as_bool() } {
+        return false;
+    }
+    if unsafe { IsHungAppWindow(hwnd).as_bool() } {
+        return true;
+    }
+    // `IsHungAppWindow` 要连续 5 秒没响应才置位；刚被挂起 / 刚卡住的窗口还没到时间，
+    // 用 `WM_NULL` 带超时地探一下，能更早发现「现在发消息会等到天荒地老」。
+    !responds_within(hwnd, 500)
+}
+
+/// 给窗口发一个 `WM_NULL`，看它能否在 `timeout_ms` 内回消息。
+fn responds_within(hwnd: HWND, timeout_ms: u32) -> bool {
+    unsafe {
+        let mut result: usize = 0;
+        let lr = SendMessageTimeoutW(
+            hwnd,
+            0, // WM_NULL：只探测消息循环是否还活着，不产生副作用
+            WPARAM(0),
+            LPARAM(0),
+            SMTO_ABORTIFHUNG,
+            timeout_ms,
+            Some(&mut result),
+        );
+        lr.0 != 0
+    }
+}
+
 /// 把外部进程的窗口挂到桌面壁纸层，并铺满指定显示器（`-1` = 整个虚拟桌面）。
 pub fn attach(hwnd: HWND, monitor_index: i32) -> Result<(), String> {
-    if hwnd.is_invalid() {
+    if hwnd.is_invalid() || !unsafe { IsWindow(Some(hwnd)).as_bool() } {
         return Err("壁纸窗口还没出现，稍后再试".to_string());
+    }
+    if is_window_hung(hwnd) {
+        return Err("壁纸窗口暂时无响应，稍后再挂载".to_string());
     }
     let worker = find_worker_w().ok_or_else(|| "找不到桌面壁纸层 WorkerW".to_string())?;
 
@@ -268,10 +306,30 @@ pub fn attach(hwnd: HWND, monitor_index: i32) -> Result<(), String> {
     Ok(())
 }
 
+/// 清掉「当前挂在壁纸层的窗口」记录。
+///
+/// 窗口被销毁（进程结束）后必须调用，否则 `is_wallpaper_window` / `last_attached`
+/// 还会拿着一个已失效的旧句柄做判断，甚至误把复用了同一句柄值的新窗口当成壁纸窗口。
+pub fn forget_attachment() {
+    *ATTACHED.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    *ATTACHED_WORKER.lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
 /// 从壁纸层摘下来，恢复成普通的顶层窗口。
+///
+/// 两个安全前提：
+/// * 窗口已经不存在（进程被结束后很常见）→ 直接当作成功，**绝不**对失效句柄做 `SetParent`；
+/// * 窗口无响应 → 跳过 `SetParent`，返回错误让调用方记日志。宁可少摘一次，
+///   也不要把宿主卡死在跨进程消息上（删除 / 停止正在运行且被挂起的壁纸时最容易踩到）。
+///
+/// 无论成功失败都会清掉挂载记录，避免句柄残留。
 pub fn detach(hwnd: HWND) -> Result<(), String> {
-    if hwnd.is_invalid() {
+    forget_attachment();
+    if hwnd.is_invalid() || !unsafe { IsWindow(Some(hwnd)).as_bool() } {
         return Ok(());
+    }
+    if is_window_hung(hwnd) {
+        return Err("壁纸窗口无响应，跳过 detach（进程会被结束，窗口随后由系统销毁）".to_string());
     }
     unsafe {
         SetParent(hwnd, None).map_err(|e| format!("SetParent(恢复) 失败：{e}"))?;
@@ -304,8 +362,6 @@ pub fn detach(hwnd: HWND) -> Result<(), String> {
         )
         .ok();
     }
-    *ATTACHED.lock().unwrap_or_else(|e| e.into_inner()) = None;
-    *ATTACHED_WORKER.lock().unwrap_or_else(|e| e.into_inner()) = None;
     Ok(())
 }
 
@@ -318,7 +374,7 @@ pub fn detach(hwnd: HWND) -> Result<(), String> {
 ///
 /// 返回是否**改动**了样式。
 pub fn enforce_no_activate(hwnd: HWND) -> bool {
-    if hwnd.is_invalid() {
+    if hwnd.is_invalid() || is_window_hung(hwnd) {
         return false;
     }
     unsafe {
@@ -395,7 +451,7 @@ pub fn hidden_on_desktop(hwnd: HWND) -> bool {
 /// 显示桌面结束后用它恢复壁纸：用 `SW_SHOW` 会激活窗口，可能把焦点从桌面图标层抢走；
 /// `SW_SHOWNA` 只在当前位置显示、不改激活状态，正好符合壁纸「只显示、不响应」的定位。
 pub fn show_no_activate(hwnd: HWND) {
-    if hwnd.is_invalid() {
+    if hwnd.is_invalid() || is_window_hung(hwnd) {
         return;
     }
     unsafe {
@@ -410,7 +466,7 @@ pub fn show_no_activate(hwnd: HWND) {
 /// （高 DPI 屏、比如 2560×1600@200% 上尤其明显：会缩成 1280×800）。所以这里顺手把
 /// 几何按 `target_rect(monitor_index)` 重新摆一遍。
 pub fn restore_on_desktop(hwnd: HWND, monitor_index: i32) {
-    if hwnd.is_invalid() {
+    if hwnd.is_invalid() || is_window_hung(hwnd) {
         return;
     }
     unsafe {
@@ -577,7 +633,7 @@ pub fn system_diagnostics() -> String {
 /// 理由同 `enforce_no_activate`：属性可能因为重挂、explorer 重建等被重置。
 /// 成本只是一次 `DwmSetWindowAttribute`，可以忽略。
 pub fn enforce_peek_excluded(hwnd: HWND) {
-    if hwnd.is_invalid() {
+    if hwnd.is_invalid() || is_window_hung(hwnd) {
         return;
     }
     let exclude_peek = TRUE;
@@ -686,8 +742,11 @@ pub fn client_size(hwnd: HWND) -> (i32, i32) {
 
 /// 把窗口挪到指定屏幕矩形（挂在壁纸层时坐标会自动换算成父窗口客户区）。
 pub fn move_window(hwnd: HWND, rect: RECT) -> Result<(), String> {
-    if hwnd.is_invalid() {
+    if hwnd.is_invalid() || !unsafe { IsWindow(Some(hwnd)).as_bool() } {
         return Err("窗口无效".to_string());
+    }
+    if is_window_hung(hwnd) {
+        return Err("窗口无响应，跳过移动".to_string());
     }
     let (x, y) = unsafe {
         match GetParent(hwnd) {
@@ -883,7 +942,13 @@ pub fn is_desktop_foreground() -> bool {
         if foreground.is_invalid() {
             return false;
         }
-        // 桌面图标层（SHELLDLL_DefView）本身也可能是前台窗口
+        // 前台可能直接就是 WorkerW / SHELLDLL_DefView / SysListView32，
+        // 也可能只是这些桌面窗口的子窗口。三者都要认，否则 Win+D 回到桌面时
+        // 会被误判成“仍在应用里”，后台的无边框全屏游戏就会一直把壁纸按在暂停状态。
+        if is_desktop_window(foreground) {
+            return true;
+        }
+
         let view = find_ex(
             Some(foreground),
             Some(HWND::default()),
@@ -893,13 +958,8 @@ pub fn is_desktop_foreground() -> bool {
             return true;
         }
 
-        let mut buffer = [0u16; 64];
-        let length = GetClassNameW(foreground, &mut buffer);
-        if length <= 0 {
-            return false;
-        }
-        let class = String::from_utf16_lossy(&buffer[..length as usize]);
-        matches!(class.as_str(), "Progman" | "WorkerW")
+        let root = GetAncestor(foreground, GA_ROOT);
+        !root.is_invalid() && root != foreground && is_desktop_window(root)
     }
 }
 
@@ -1013,20 +1073,20 @@ pub fn foreground_window_summary() -> String {
 ///
 /// 与 `is_desktop_foreground` 的区别：那个判断的是「**前台**是不是桌面」，这里只判断
 /// 「传来的这个窗口句柄是不是桌面层」，用于遍历窗口时把桌面层排除出「覆盖了屏幕的应用」。
-pub fn is_desktop_window(hwnd: HWND) -> bool {    unsafe {
-        if hwnd.is_invalid() {
-            return false;
-        }
-        let mut buffer = [0u16; 64];
-        let length = GetClassNameW(hwnd, &mut buffer);
-        if length <= 0 {
-            return false;
-        }
-        let class = String::from_utf16_lossy(&buffer[..length as usize]);
-        // 只比对顶层类名：桌面图标列表 SysListView32 是 DefView 的子窗口，
-        // EnumWindows 只枚举顶层窗口，不会碰到它，这里无需再管。
-        matches!(class.as_str(), "Progman" | "WorkerW" | "SHELLDLL_DefView")
+pub fn is_desktop_window(hwnd: HWND) -> bool {
+    if hwnd.is_invalid() {
+        return false;
     }
+    is_desktop_class(&window_class(hwnd))
+}
+
+/// 桌面层本身的窗口类（含桌面图标列表）。前台命中这些类时，不应该再去看
+/// 后面那些仍然可见、但已经被桌面盖住的无边框全屏窗口。
+fn is_desktop_class(class: &str) -> bool {
+    matches!(
+        class,
+        "Progman" | "WorkerW" | "SHELLDLL_DefView" | "SysListView32" | "_cls_desk_"
+    )
 }
 
 /* ------------------------------------------------- 输入队列 / 鼠标捕获 */
@@ -1143,6 +1203,58 @@ pub struct Thumbnail {
     pub width: u32,
     pub height: u32,
     pub rgba: Vec<u8>,
+}
+
+/// 抓图结果：区分「没抓到」和「超时」——超时往往意味着目标窗口卡死了，值得记日志。
+pub enum ThumbnailOutcome {
+    Got(Thumbnail),
+    Miss,
+    /// 目标窗口在超时时间内没有响应（`PrintWindow` 卡住）。
+    Timeout,
+    /// 上一次抓图还卡着，本次直接跳过。
+    Busy,
+}
+
+/// 同时只允许一个抓图线程；卡住时不再堆线程。
+static THUMB_INFLIGHT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 带超时的抓图。
+///
+/// `PrintWindow` 是同步跨进程调用：只要壁纸窗口的消息循环不转（Unity 卡死、进程被
+/// `NtSuspendProcess` 挂起、D3D 设备丢失…），它就会无限期等下去，把调用线程一起带走，
+/// 表现出来就是「宿主/桌面忽然无响应」（Windows 事件日志里的 AppHangXProcB1）。
+/// 放到独立线程里 + 超时返回，界面和 IPC 线程池就永远不会被拖死；卡住的那条线程会在
+/// 窗口恢复响应后自己退出并清掉 in-flight 标记。
+pub fn capture_thumbnail_guarded(
+    hwnd: isize,
+    max_width: i32,
+    timeout: std::time::Duration,
+) -> ThumbnailOutcome {
+    use std::sync::atomic::Ordering;
+    use std::sync::mpsc;
+    if hwnd == 0 {
+        return ThumbnailOutcome::Miss;
+    }
+    if THUMB_INFLIGHT.swap(true, Ordering::SeqCst) {
+        return ThumbnailOutcome::Busy;
+    }
+    let (tx, rx) = mpsc::channel();
+    let spawned = std::thread::Builder::new()
+        .name("wp-thumbnail".to_string())
+        .spawn(move || {
+            let thumb = capture_thumbnail(HWND(hwnd as *mut c_void), max_width);
+            THUMB_INFLIGHT.store(false, Ordering::SeqCst);
+            let _ = tx.send(thumb);
+        });
+    if spawned.is_err() {
+        THUMB_INFLIGHT.store(false, Ordering::SeqCst);
+        return ThumbnailOutcome::Miss;
+    }
+    match rx.recv_timeout(timeout) {
+        Ok(Some(thumb)) => ThumbnailOutcome::Got(thumb),
+        Ok(None) => ThumbnailOutcome::Miss,
+        Err(_) => ThumbnailOutcome::Timeout,
+    }
 }
 
 /// 把窗口画面抓成一张缩略图，给主界面做「当前壁纸预览」。
@@ -1312,6 +1424,22 @@ mod tests {
         // 普通应用窗口不能误判为外壳
         for class in ["UnityWndClass", "Chrome_WidgetWin_1", "Notepad"] {
             assert!(!is_shell_class(class), "{class} 不应视为外壳窗口");
+        }
+    }
+
+    #[test]
+    fn desktop_icon_windows_are_recognized_as_the_desktop() {
+        for class in [
+            "Progman",
+            "WorkerW",
+            "SHELLDLL_DefView",
+            "SysListView32",
+            "_cls_desk_",
+        ] {
+            assert!(is_desktop_class(class), "{class} 应视为桌面层窗口");
+        }
+        for class in ["UnityWndClass", "Chrome_WidgetWin_1", "Shell_TrayWnd"] {
+            assert!(!is_desktop_class(class), "{class} 不应视为桌面层窗口");
         }
     }
 }

@@ -93,6 +93,28 @@ impl Default for RuntimeState {
     }
 }
 
+/// 壁纸进程退出时的现场（交给日志层写进 host.log / crash.log）。
+///
+/// 为什么要单独记：`tick` 只检测到「进程没了」，但「怎么没的」——正常退出、被系统
+/// 强杀、还是 Unity 自己崩了（`0xC0000005` 之类）——全在退出码里。没有这条，
+/// 日志只能写一句「壁纸进程自己退出了」，等于什么都没说。
+#[derive(Debug, Clone)]
+pub struct ExitReport {
+    pub pid: u32,
+    /// Windows 退出码；进程句柄已失效时为 `None`。
+    pub code: Option<i32>,
+    /// 这次一共跑了多久（毫秒）。
+    pub uptime_ms: u64,
+    /// 退出时是否处于「暂停（进程挂起）」状态。
+    pub was_paused: bool,
+    pub was_desktop: bool,
+    pub exe: String,
+    /// 峰值内存（MB）。
+    pub peak_memory_mb: f32,
+    pub hwnd: i64,
+    pub last_error: String,
+}
+
 /// 当前跑着的壁纸进程 + 它的状态。
 pub struct UnityHost {
     child: Option<Child>,
@@ -118,6 +140,10 @@ pub struct UnityHost {
     last_desktop_restore: Option<Instant>,
     /// 当前自动暂停的原因（没暂停时为空串），日志与界面都用它回答"为什么停了"。
     pause_reason: String,
+    /// 本次运行观察到的峰值内存（MB），退出报告用。
+    peak_memory_mb: f32,
+    /// 进程退出现场；由后台扫描线程取走后写日志（见 [`UnityHost::take_exit_report`]）。
+    pending_exit: Option<ExitReport>,
 }
 
 /// 自动暂停条件的去抖：条件要**持续**满足 `hold` 才真的暂停。
@@ -179,6 +205,8 @@ impl Default for UnityHost {
             hidden_since: None,
             last_desktop_restore: None,
             pause_reason: String::new(),
+            peak_memory_mb: 0.0,
+            pending_exit: None,
         }
     }
 }
@@ -191,6 +219,14 @@ impl UnityHost {
     /// 当前自动暂停的原因（没自动暂停时为空串）——"壁纸为什么停了"的答案。
     pub fn pause_reason(&self) -> &str {
         &self.pause_reason
+    }
+
+    /// 取走「上一个壁纸进程是怎么退出的」现场。
+    ///
+    /// 由后台扫描线程在 `tick` 之后调用并写日志；这里只负责交出数据（`tick` 本身
+    /// 没有 `AppHandle`，不方便直接写日志）。
+    pub fn take_exit_report(&mut self) -> Option<ExitReport> {
+        self.pending_exit.take()
     }
 
     pub fn mode(&self) -> Mode {
@@ -278,6 +314,8 @@ impl UnityHost {
         self.hidden_since = None;
         self.last_desktop_restore = None;
         self.pause_reason.clear();
+        self.peak_memory_mb = 0.0;
+        self.pending_exit = None;
         self.state = RuntimeState {
             mode: mode.as_str().to_string(),
             pid,
@@ -300,13 +338,20 @@ impl UnityHost {
         Ok(self.state())
     }
 
-    /// 结束壁纸进程，并确保它的窗口**一定**从桌面层摘下来。
+    /// 结束壁纸进程，并确保它的窗口从桌面层消失。
     ///
-    /// 这里要防的是「停止后壁纸还在桌面上」：只要窗口还挂在 WorkerW 上，进程又没能杀掉，
-    /// 用户就会看到一层摘不掉的壁纸。所以：
-    /// * 记录的 `hwnd` 可能还是 0（进程刚起来就被停），那就按 PID 再找一次主窗口；
-    /// * `kill` 之后確認进程真的没了，还在就用 PID 强杀一次。
+    /// 顺序很关键：**先杀进程，再谈窗口**。
+    ///
+    /// 旧顺序是 `resume → detach(SetParent) → kill`。对一个被 `NtSuspendProcess` 挂起
+    /// （或本身卡死）的 Unity 窗口调用 `SetParent` 是**跨进程同步调用**，对方不处理消息
+    /// 就会无限等待 —— 宿主主线程一卡，Windows 直接按「无响应」把它关掉
+    /// （事件日志 `AppHangXProcB1`），用户看到的就是「删除正在运行的壁纸时卡死闪退」。
+    ///
+    /// 进程一旦 `TerminateProcess` 结束，它创建的窗口由系统一并销毁，根本不需要再
+    /// `SetParent`；只有在杀不干净、窗口还活着时才兜底 detach，且 `desktop::detach`
+    /// 自身会跳过无响应窗口，绝不阻塞调用方。
     pub fn stop(&mut self) {
+        let started = Instant::now();
         let pid = self.state.pid;
         let hwnd = self.hwnd().or_else(|| {
             if pid == 0 {
@@ -317,23 +362,48 @@ impl UnityHost {
         });
 
         // 先停输入转发：它要把被壁纸窗口抢走的鼠标捕获还给桌面，而这件事必须在
-        // 窗口被摘下来 / 进程被杀掉**之前**做（窗口没了就无从判断捕获在谁手里）。
+        // 窗口被销毁 / 进程被杀掉**之前**做。
         crate::win::input::clear_target();
 
-        if let Some(hwnd) = hwnd {
-            let _ = desktop::detach(hwnd);
+        // 挂起的进程也能被 TerminateProcess 杀掉；先恢复一次只是为了让万一杀不掉时的
+        // 兜底 detach 不至于面对一个完全不处理消息的窗口。
+        if pid != 0 {
+            let _ = control::resume_process(pid);
         }
 
+        // 关键：先结束进程。窗口会随进程销毁，避免对（可能已挂起的）窗口做 SetParent。
         if let Some(mut child) = self.child.take() {
-            // 挂起状态下的进程也要能杀掉：先尽力恢复
-            let _ = control::resume_process(child.id());
             let _ = child.kill();
             let _ = child.wait();
         }
-
         // `Child::kill` 失败（进程被别的句柄挡住、刚变成僵尸等）时兜底强杀
         if pid != 0 && control::process_alive(pid) {
             let _ = control::terminate_process(pid);
+        }
+
+        // 兜底：进程没杀干净、窗口还活着时才 detach。窗口已销毁时这里只是清理挂载记录，
+        // 不会发生任何跨进程调用。
+        if let Some(hwnd) = hwnd {
+            if let Err(err) = desktop::detach(hwnd) {
+                crate::crash::write_host_log(
+                    "warn",
+                    &format!("停止壁纸时 detach 被跳过：{err}（PID {pid}）"),
+                );
+            }
+        } else {
+            desktop::forget_attachment();
+        }
+
+        let cost = started.elapsed();
+        if cost > Duration::from_millis(800) {
+            crate::crash::write_host_log(
+                "warn",
+                &format!(
+                    "停止壁纸耗时 {:.1} 秒（PID {}）：结束进程 / detach 可能被跨进程消息卡住",
+                    cost.as_secs_f64(),
+                    pid
+                ),
+            );
         }
 
         self.mode = Mode::Stopped;
@@ -394,14 +464,35 @@ impl UnityHost {
         }
 
         // 1. 进程还在吗
-        if !control::process_alive(self.state.pid) {
+        //
+        // 先问 `Child::try_wait`：这样能拿到**退出码**。Unity 崩溃时退出码是
+        // `0xC0000005` 这类 SEH 码，光看 `process_alive == false` 是看不出来的。
+        let child_status = self
+            .child
+            .as_mut()
+            .and_then(|child| child.try_wait().ok().flatten());
+        if child_status.is_some() || !control::process_alive(self.state.pid) {
             let was_desktop = self.mode == Mode::Desktop;
+            // 进程已经退出，内存要取最后一次 tick 记下的值（现在再查多半是 0）
+            let peak = self.peak_memory_mb.max(self.state.memory_mb);
+            let report = ExitReport {
+                pid: self.state.pid,
+                code: child_status.and_then(|status| status.code()),
+                uptime_ms: now_ms().saturating_sub(self.state.started_at_ms),
+                was_paused: self.state.paused,
+                was_desktop,
+                exe: self.state.exe.clone(),
+                peak_memory_mb: peak,
+                hwnd: self.state.hwnd,
+                last_error: self.state.last_error.clone(),
+            };
             self.stop();
             self.state.last_error = if was_desktop {
                 "壁纸进程自己退出了".to_string()
             } else {
                 "预览窗口已关闭".to_string()
             };
+            self.pending_exit = Some(report);
             return;
         }
 
@@ -413,9 +504,20 @@ impl UnityHost {
         }
 
         // 3. 桌面模式：挂上 WorkerW；掉了就重挂（explorer 重启、Win+D 之类）
-        if self.mode == Mode::Desktop {
+        //
+        // 进程被挂起时，它的窗口线程不再处理任何消息。此刻再做 SetParent / SetWindowPos /
+        // ShowWindow / SetWindowLongPtr 这类**跨进程同步调用**，会一直等对方回消息，
+        // 表现得就是宿主和 explorer 一起「无响应」（Windows 事件日志里的 AppHangXProcB1）。
+        // 所以暂停期间不做任何窗口操作 —— 恢复后的第一个 tick 会照常补上。
+        if self.state.paused {
+            // 什么都不做：读状态的 IsWindowVisible / GetParent 不涉及消息，仍可安全执行
+        } else if self.mode == Mode::Desktop {
             if let Some(hwnd) = self.hwnd() {
-                if desktop::hidden_on_desktop(hwnd) {
+                if desktop::is_window_hung(hwnd) {
+                    // 窗口暂时无响应（Unity 加载场景 / 被挂起还没恢复干净等）：
+                    // 这一轮不做任何跨进程窗口操作，否则会把扫描线程无限期卡住。
+                    self.state.last_error = "壁纸窗口暂时无响应，跳过本轮窗口操作".to_string();
+                } else if desktop::hidden_on_desktop(hwnd) {
                     // 还挂在壁纸层上，但被「显示桌面 / Win+D」藏起来了。
                     //
                     // Win11 的桌面是分层 + 提升的，显示桌面会把 WorkerW 这一层整体藏掉；
@@ -529,7 +631,11 @@ impl UnityHost {
         }
         self.state.auto_paused = auto && !self.state.user_paused;
         self.state.occluded = system.covered;
-        let _ = self.apply_pause();
+        if let Err(err) = self.apply_pause() {
+            // 挂起 / 恢复失败以前是被 `let _ =` 吞掉的，日志里完全看不出来
+            crate::crash::note(format!("暂停/恢复失败：{err}"));
+            self.state.last_error = err;
+        }
 
         // 5. 音量 / 静音（会话还没出现就过两秒再试）
         let volume_changed = self.applied_volume != Some(settings.volume);
@@ -557,8 +663,10 @@ impl UnityHost {
         self.state.muted = settings.muted;
 
         // 6. 输入转发
-        let forwarding =
-            settings.input_forward && !settings.input_locked && self.mode == Mode::Desktop;
+        let forwarding = settings.input_forward
+            && !settings.input_locked
+            && self.mode == Mode::Desktop
+            && !self.state.paused;
         if forwarding {
             if let Some(hwnd) = self.hwnd() {
                 let _ = crate::win::input::set_target(hwnd.0 as isize, true, true);
@@ -570,6 +678,9 @@ impl UnityHost {
 
         // 7. 内存占用（每 tick 采一次，界面上能看到它吃多少）
         self.state.memory_mb = control::process_memory_mb(self.state.pid);
+        if self.state.memory_mb > self.peak_memory_mb {
+            self.peak_memory_mb = self.state.memory_mb;
+        }
     }
 }
 

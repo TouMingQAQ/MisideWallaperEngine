@@ -34,7 +34,7 @@ JSON 一律 **camelCase**。字段全部有默认值：文件缺失 / 坏掉 / �
 | `extraArgs` | string | `""` | 追加的启动参数（空格分隔）；排在宿主自己拼的参数之后，可以覆盖它们 |
 | `graphicsApi` | string | `"auto"` | `auto` / `d3d11` / `d3d12` → 壁纸进程的 `-force-d3d11` / `-force-d3d12`。**D3D12 下动态分辨率（`ScalableBufferManager`）才生效**，也就是 `renderScale` 只有选 D3D12 才有意义；改这一项会重启壁纸进程 |
 | `pauseOnFullscreen` | bool | `true` | 有应用遮挡桌面时暂停壁纸（判定见 `pauseAlgorithm`） |
-| `pauseAlgorithm` | string | `"grid"` | 遮挡检测算法：`grid`（多窗口拼合，默认）/ `foreground`（仅前台窗口）/ `all`（任一窗口）/ `gamemode`（仅独占全屏游戏）。对齐 Lively 的 `ProcessMonitorAlgorithm` |
+| `pauseAlgorithm` | string | `"grid"` | 遮挡检测算法：`grid`（多窗口拼合，默认）/ `foreground`（仅前台窗口）/ `all`（任一窗口）/ `gamemode`（仅独占全屏游戏）。对齐 Lively 的 `ProcessMonitorAlgorithm`；桌面重新成为前台后不会再被后台的全屏窗口判定为遮挡 |
 | `pauseOnBattery` | bool | `false` | 使用电池时暂停壁纸 |
 | `pauseOnBatterySaver` | bool | `false` | 系统进入电池节能模式（Battery Saver）时暂停壁纸 |
 | `pauseWhenForeground` | bool | `false` | 前台有任意应用（非桌面）时暂停壁纸，比「遮挡」更激进 |
@@ -245,10 +245,13 @@ Rust 命令名一律 snake_case，**参数名一律 camelCase**（Tauri 会自�
 | `set_audio_enabled` | `enabled: boolean` | `AudioStatus` |
 | `set_autostart` | `enabled: boolean` | `boolean` |
 | `open_log_dir` | — | `void` |
+| `export_diagnostics` | — | `string`（保存路径；已取消则 rejected）。打包系统/DPI/几何/设置/运行状态/日志，以及 `crash.log`、崩溃现场 `.txt`、minidump |
+| `ui_log` | `level: "error"\|"warn"\|"info"`, `message: string` | `void`（界面侧异常写进宿主日志，前缀 `[界面]`） |
+| `ui_heartbeat` | — | `void`（界面每 3 秒一次，供看门狗判断渲染进程是否存活） |
 
 > `wallpaper_thumbnail` 是主界面「当前壁纸预览」用的，走 `PrintWindow(PW_RENDERFULLCONTENT)` +
-> `StretchBlt` 缩到 720px 宽以内。**壁纸进程被挂起时宿主不会去抓**（挂起的进程不响应
-> `PrintWindow`，硬抓会把调用线程拖住），这种情况直接返回 0 字节。用 DirectX 独占渲染的窗口
+> `StretchBlt` 缩到 720px 宽以内。抓图放在独立线程并带 1500ms 超时：壁纸进程被挂起或窗口
+> 卡死时不会把调用线程拖住，超时直接返回 0 字节并记一条 warning。用 DirectX 独占渲染的窗口
 > 经常只能抓到全黑帧，宿主也按「抓不到」处理，界面应该显示占位文案而不是一块黑屏。
 
 ## 4. 事件（`listen`）
@@ -373,12 +376,18 @@ JSON 形如：
 ```
 <app_config_dir>/settings.json          设置
 <app_config_dir>/wallpapers.json        壁纸库索引（id / name / 导入时间 / exe 相对路径）
+<app_config_dir>/session.json           会话标记：正常退出删除，启动时还在说明上次异常退出
 <libraryDir>/<id>/                      单个壁纸解压后的全部文件
 <app_log_dir>/host.log                  运行日志（滚动，≤2MB）
+<app_log_dir>/crash.log                 崩溃 / 卡死日志（滚动，≤2MB）
+<app_log_dir>/crash-<时间>-*.txt        单个崩溃事件现场（退出码 / 事件日志 / Unity Player.log）
+<app_log_dir>/crash-<时间>.dmp          宿主原生崩溃 minidump
 ```
 
 * `<app_config_dir>` = `%APPDATA%\com.toumingqaq.miside-wallpaper-engine`
 * `<app_log_dir>` = `%LOCALAPPDATA%\com.toumingqaq.miside-wallpaper-engine\logs`
+* 崩溃捕捉包含：panic 钩子（线程名 + 位置 + 回溯）、未处理异常过滤器（异常码 / 出错模块 / minidump）、
+  看门狗（扫描线程 / 界面主线程 / WebView 心跳）、壁纸子进程退出码、Windows 应用日志与 Unity `Player.log`。
 * `libraryDir` 留空时 = `<app_config_dir>\wallpapers`；用户也可以在设置里指到程序目录或别的盘。
 * 解压必须防 **zip-slip**（`..` / 绝对路径 / 符号链接一律拒绝）并保留目录结构。
 * 中文 zip 的 GBK 文件名要在解压时正确还原（UTF-8 优先，失败回退 GBK）。

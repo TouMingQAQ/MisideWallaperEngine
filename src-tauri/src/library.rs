@@ -9,7 +9,7 @@
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager, Runtime};
@@ -382,7 +382,7 @@ pub fn remove<R: Runtime>(
                 dir.display()
             ));
         }
-        fs::remove_dir_all(long_path(&dir))
+        remove_dir_all_retrying(&dir, 6)
             .map_err(|e| format!("删除 {} 失败（壁纸可能正在运行）：{e}", dir.display()))?;
     }
 
@@ -727,6 +727,27 @@ fn long_path(path: &Path) -> PathBuf {
     } else {
         path.to_path_buf()
     }
+}
+
+/// 删除整个壁纸目录，带重试。
+///
+/// 壁纸进程刚被结束时，Windows 上常有几处会短暂持有文件句柄：DWM 的缩略图缓存、
+/// 杀毒 / 搜索索引、Unity 自己还没落完的日志等。这时 `remove_dir_all` 会报「文件被占用」，
+/// 但等一两百毫秒就好。重试几次，比直接给用户报错友好得多。
+fn remove_dir_all_retrying(dir: &Path, attempts: u32) -> std::io::Result<()> {
+    let mut last_err = None;
+    for attempt in 0..attempts {
+        match fs::remove_dir_all(long_path(dir)) {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                last_err = Some(err);
+                if attempt + 1 < attempts {
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| std::io::Error::other("删除目录失败")))
 }
 
 /// `child` 是否在 `root` 之内（用于删除前的安全检查）。
